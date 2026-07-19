@@ -580,6 +580,11 @@ async function generateWithLeg(leg, rawLlm, prompts) {
       body: JSON.stringify({
         model,
         stream: false,
+        // Qwen 3 enables thinking by default in Ollama. A radio bulletin needs a
+        // concise final script, not a long hidden reasoning pass, so disable it.
+        think: false,
+        // Keep the shared station model warm across the next hourly bulletin.
+        keep_alive: '75m',
         messages: [
           { role: 'system', content: prompts.system },
           { role: 'user', content: prompts.user },
@@ -588,9 +593,12 @@ async function generateWithLeg(leg, rawLlm, prompts) {
           num_ctx: Number(leg.numCtx || rawLlm.numCtx) || undefined,
           repeat_penalty: Number(leg.repeatPenalty || rawLlm.repeatPenalty) || undefined,
           temperature: 0.35,
+          // Bound local generation so a verbose model cannot spend several
+          // minutes producing text far beyond the configured bulletin length.
+          num_predict: Math.min(maxTokens, 600),
         },
       }),
-    }, 90000);
+    }, 180000);
     return trimOutput(body?.message?.content || body?.response);
   }
 
@@ -1005,10 +1013,15 @@ async function runBulletin(reason = 'manual') {
 
     const snapshot = await subwaveSnapshot();
     const presenter = resolvePresenter(snapshot, config);
+    const activeLlm = snapshot.values?.llm || snapshot.raw?.llm || {};
+    await log(`Generating bulletin script with ${activeLlm.provider || 'unknown'}/${activeLlm.model || 'unknown'} (${freshness}; ${candidates.length} candidates).`);
     const generated = await generateBulletinText(snapshot, config, candidates, presenter, freshness);
+    await log(`Bulletin script ready (${generated.stories.length} stories). Starting TTS.`);
     const speechPaths = [];
     let resolvedSpeech = null;
-    for (const story of generated.stories) {
+    for (let storyIndex = 0; storyIndex < generated.stories.length; storyIndex++) {
+      const story = generated.stories[storyIndex];
+      await log(`Rendering TTS story ${storyIndex + 1}/${generated.stories.length}.`);
       const speech = await synthesizeVoice(snapshot, config, presenter, story);
       speechPaths.push(speech.path);
       resolvedSpeech ||= speech;
