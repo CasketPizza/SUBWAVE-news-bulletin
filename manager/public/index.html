@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SUB/WAVE Hourly News</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">SUB/WAVE EXTENSION</p>
+        <h1>Hourly News Bulletin</h1>
+        <p class="lede">Intro jingle, headlines over a music bed, then an outro—using SUB/WAVE’s active DJ voice and persona.</p>
+      </div>
+      <button id="runNow" class="primary">Run bulletin now</button>
+    </header>
+
+    <div id="notice" class="notice hidden"></div>
+
+    <section>
+      <h2>Status & updates</h2>
+      <div class="status-grid">
+        <div><span>Manager</span><strong id="managerStatus">Loading…</strong></div>
+        <div><span>Extension</span><strong id="versionStatus">Loading…</strong></div>
+        <div><span>SUB/WAVE hook</span><strong id="patchStatus">Loading…</strong></div>
+        <div><span>Last bulletin</span><strong id="lastRun">Never</strong></div>
+      </div>
+      <div class="actions">
+        <button id="checkUpdate">Check for updates</button>
+        <button id="updateNow">Update now</button>
+        <button id="reapply">Reapply after SUB/WAVE update</button>
+        <button id="rollback">Roll back</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Schedule</h2>
+      <label class="toggle"><input id="enabled" type="checkbox"> Enable automatic bulletins</label>
+      <div class="radio-list">
+        <label><input type="radio" name="scheduleMode" value="after"> After SUB/WAVE’s hourly announcement <small>(default; queues near the top of the hour after a short delay)</small></label>
+        <label><input type="radio" name="scheduleMode" value="before"> Before the hourly announcement <small>(at :59)</small></label>
+        <label><input type="radio" name="scheduleMode" value="replace"> Replace the normal hourly announcement</label>
+        <label><input type="radio" name="scheduleMode" value="custom"> At a custom minute each hour</label>
+        <label><input type="radio" name="scheduleMode" value="manual"> Manual only</label>
+      </div>
+      <div class="grid two">
+        <label>Custom minute
+          <input id="customMinute" type="number" min="0" max="59">
+        </label>
+        <label>After-mode delay
+          <div class="suffix"><input id="afterDelaySeconds" type="number" min="5" max="55"><span>seconds</span></div>
+        </label>
+        <label>Station timezone
+          <input id="timeZone" type="text" placeholder="Australia/Sydney">
+        </label>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <div>
+          <h2>News sources</h2>
+          <p>RSS 2.0 and Atom feeds are accepted. Sources are mixed round-robin.</p>
+        </div>
+        <button id="addFeed">+ Add source</button>
+      </div>
+      <div id="feeds" class="feed-list"></div>
+      <div class="grid three">
+        <label>Items fetched per source
+          <input id="maxItemsPerFeed" type="number" min="1" max="30">
+        </label>
+        <label>Candidate pool
+          <input id="maxCandidates" type="number" min="3" max="30">
+        </label>
+        <label>Stories read
+          <input id="maxHeadlines" type="number" min="1" max="10">
+        </label>
+      </div>
+      <label>Maximum spoken length
+        <div class="suffix compact"><input id="maxLengthSeconds" type="number" min="20" max="180"><span>seconds</span></div>
+      </label>
+    </section>
+
+    <section>
+      <h2>Audio package</h2>
+      <div class="audio-grid">
+        <article class="audio-card">
+          <h3>Intro jingle</h3>
+          <p>Plays before the bulletin.</p>
+          <input id="introFile" type="file" accept="audio/*">
+          <div class="actions"><button data-upload="intro">Upload</button><button data-preview="intro">Preview</button><button data-remove="intro">Remove</button></div>
+          <span id="introState" class="asset-state"></span>
+        </article>
+        <article class="audio-card">
+          <h3>Background music</h3>
+          <p>Mixed underneath the generated headlines.</p>
+          <input id="bedFile" type="file" accept="audio/*">
+          <div class="actions"><button data-upload="bed">Upload</button><button data-preview="bed">Preview</button><button data-remove="bed">Remove</button></div>
+          <span id="bedState" class="asset-state"></span>
+        </article>
+        <article class="audio-card">
+          <h3>Outro jingle</h3>
+          <p>Plays after the bulletin.</p>
+          <input id="outroFile" type="file" accept="audio/*">
+          <div class="actions"><button data-upload="outro">Upload</button><button data-preview="outro">Preview</button><button data-remove="outro">Remove</button></div>
+          <span id="outroState" class="asset-state"></span>
+        </article>
+      </div>
+      <div class="grid four">
+        <label>Bed volume
+          <div class="suffix"><input id="bedVolumeDb" type="number" min="-40" max="0" step="1"><span>dB</span></div>
+        </label>
+        <label>Fade in
+          <div class="suffix"><input id="bedFadeIn" type="number" min="0" max="10" step="0.05"><span>sec</span></div>
+        </label>
+        <label>Fade out
+          <div class="suffix"><input id="bedFadeOut" type="number" min="0" max="10" step="0.05"><span>sec</span></div>
+        </label>
+        <label class="toggle bottom"><input id="loopBed" type="checkbox"> Loop short beds</label>
+      </div>
+      <audio id="preview" controls class="hidden"></audio>
+    </section>
+
+    <div class="save-row">
+      <button id="save" class="primary">Save settings</button>
+    </div>
+
+    <section>
+      <div class="section-heading"><h2>Recent log</h2><button id="refreshLogs">Refresh</button></div>
+      <pre id="logs">Loading…</pre>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

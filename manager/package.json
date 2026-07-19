@@ -1,0 +1,14 @@
+{
+  "name": "subwave-news-bulletin-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "fast-xml-parser": "^5.2.5",
+    "multer": "^2.0.2"
+  }
+}
