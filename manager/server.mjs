@@ -45,6 +45,27 @@ const DEFAULTS = {
   maxCandidates: 12,
   maxHeadlines: 5,
   maxLengthSeconds: 60,
+
+  // Newsroom prompt controls. These are intentionally separate so an operator
+  // can change what gets selected, how source material is interpreted, and how
+  // the finished bulletin sounds without editing SUB/WAVE's skill file.
+  storySelectionInstructions: `Choose the most consequential and genuinely new stories. Prioritise Australian national and local-interest news, then major world developments. Avoid filling the bulletin with several minor stories about the same topic.`,
+  articleHandlingInstructions: `Treat each supplied headline and RSS summary as source material, not as wording to copy. Paraphrase accurately, preserve uncertainty and attribution, and never add facts that are not present. Do not merge separate reports into one event. Mention a publication only when attribution materially improves clarity.`,
+  deliveryInstructions: `Sound like a composed radio newsreader. Use complete natural sentences, brief transitions, and an even pace. Begin directly, avoid a long greeting, and finish cleanly without teasing music or saying that links are available.`,
+
+  // Presenter and voice routing. presenterMode=persona selects a dedicated
+  // SUB/WAVE persona for both style and, by default, voice. voiceMode=override
+  // keeps that presenter's writing style but renders through any configured
+  // engine/voice combination.
+  presenterMode: 'on-air',
+  presenterPersonaId: '',
+  voiceMode: 'presenter',
+  voiceEngine: 'piper',
+  voiceName: '',
+  voiceCloudProvider: 'openai',
+  voiceSpeed: 1,
+  voiceLanguage: '',
+
   bedVolumeDb: -18,
   bedFadeIn: 0.75,
   bedFadeOut: 1.5,
@@ -112,10 +133,17 @@ async function settings() {
   return { ...DEFAULTS, ...(await loadJson(SETTINGS_FILE, DEFAULTS)) };
 }
 
+function cleanInstruction(value, fallback) {
+  const text = String(value ?? '').trim();
+  return (text || fallback).slice(0, 6000);
+}
+
 function cleanSettings(body) {
   const input = body && typeof body === 'object' ? body : {};
   const mode = ['after', 'before', 'custom', 'manual'].includes(input.scheduleMode)
     ? input.scheduleMode : 'after';
+  const presenterMode = input.presenterMode === 'persona' ? 'persona' : 'on-air';
+  const voiceMode = input.voiceMode === 'override' ? 'override' : 'presenter';
   const feeds = (Array.isArray(input.feeds) ? input.feeds : [])
     .map((feed) => ({
       name: String(feed?.name || '').trim().slice(0, 100),
@@ -142,6 +170,26 @@ function cleanSettings(body) {
     maxCandidates: Math.min(30, Math.max(3, Number(input.maxCandidates) || 12)),
     maxHeadlines: Math.min(10, Math.max(1, Number(input.maxHeadlines) || 5)),
     maxLengthSeconds: Math.min(180, Math.max(20, Number(input.maxLengthSeconds) || 60)),
+    storySelectionInstructions: cleanInstruction(
+      input.storySelectionInstructions,
+      DEFAULTS.storySelectionInstructions,
+    ),
+    articleHandlingInstructions: cleanInstruction(
+      input.articleHandlingInstructions,
+      DEFAULTS.articleHandlingInstructions,
+    ),
+    deliveryInstructions: cleanInstruction(
+      input.deliveryInstructions,
+      DEFAULTS.deliveryInstructions,
+    ),
+    presenterMode,
+    presenterPersonaId: String(input.presenterPersonaId || '').trim().slice(0, 200),
+    voiceMode,
+    voiceEngine: String(input.voiceEngine || DEFAULTS.voiceEngine).trim().slice(0, 64) || DEFAULTS.voiceEngine,
+    voiceName: String(input.voiceName || '').trim().slice(0, 300),
+    voiceCloudProvider: String(input.voiceCloudProvider || DEFAULTS.voiceCloudProvider).trim().slice(0, 64) || DEFAULTS.voiceCloudProvider,
+    voiceSpeed: Math.min(2, Math.max(0.5, Number(input.voiceSpeed) || 1)),
+    voiceLanguage: String(input.voiceLanguage || '').trim().slice(0, 100),
     bedVolumeDb: Math.min(0, Math.max(-40, Number(input.bedVolumeDb) || -18)),
     bedFadeIn: Math.min(10, Math.max(0, Number(input.bedFadeIn) || 0)),
     bedFadeOut: Math.min(10, Math.max(0, Number(input.bedFadeOut) || 0)),
@@ -208,7 +256,7 @@ async function fetchFeed(feed, maxItems) {
     const response = await fetch(feed.url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'SUBWAVE-News-Bulletin/0.2 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
+        'User-Agent': 'SUBWAVE-News-Bulletin/0.4 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
       },
     });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -279,11 +327,81 @@ async function subwaveSnapshot() {
   const values = api?.values || {};
   const personas = Array.isArray(values.personas) ? values.personas : [];
   const activeId = api?.onAir?.personaId || values.activePersonaId || raw.activePersonaId;
-  const persona = personas.find((item) => item?.id === activeId) || personas[0] || {
+  const fallbackPersona = {
+    id: '',
     name: 'SUB/WAVE DJ', tagline: '', soul: '', humour: 5, localColour: 5, warmth: 5,
     language: 'English', tts: {},
   };
-  return { api, raw, values, persona };
+  const onAirPersona = personas.find((item) => item?.id === activeId) || personas[0] || fallbackPersona;
+  return { api, raw, values, personas, onAirPersona, persona: onAirPersona };
+}
+
+function resolvePresenter(snapshot, config) {
+  if (config.presenterMode === 'persona' && config.presenterPersonaId) {
+    const selected = snapshot.personas?.find((item) => item?.id === config.presenterPersonaId);
+    if (selected) return selected;
+  }
+  return snapshot.onAirPersona || snapshot.persona;
+}
+
+function uniqueVoiceOptions(values) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values) {
+    const id = String(typeof value === 'string' ? value : value?.id || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      label: String(typeof value === 'string' ? value : value?.label || id),
+    });
+  }
+  return out;
+}
+
+function subwaveOptions(snapshot) {
+  const meta = snapshot.api?.tts || {};
+  const stationTts = snapshot.values?.tts || {};
+  const voices = {
+    piper: [...(meta.piperVoices || [])],
+    kokoro: [...(meta.kokoroVoices || [])],
+    chatterbox: [...(meta.chatterboxVoices || [])],
+    'pocket-tts': [...(meta.pocketTtsVoices || []), ...(meta.pocketTtsCustomVoices || [])],
+    cloud: [],
+    remote: [],
+  };
+
+  for (const persona of snapshot.personas || []) {
+    const tts = persona?.tts || {};
+    if (tts.engine && tts.voice && voices[tts.engine]) voices[tts.engine].push(tts.voice);
+  }
+  if (stationTts.cloud?.voice) voices.cloud.push(stationTts.cloud.voice);
+  if (stationTts.kokoro?.voice) voices.kokoro.push(stationTts.kokoro.voice);
+  if (stationTts.chatterbox?.referenceVoice) voices.chatterbox.push(stationTts.chatterbox.referenceVoice);
+  if (stationTts.pocketTts?.voice) voices['pocket-tts'].push(stationTts.pocketTts.voice);
+
+  for (const engine of Object.keys(voices)) voices[engine] = uniqueVoiceOptions(voices[engine]);
+
+  const configuredEngines = Array.isArray(meta.engines) ? meta.engines : [];
+  const engines = [...new Set([
+    ...configuredEngines,
+    'piper', 'kokoro', 'chatterbox', 'pocket-tts', 'cloud', 'remote',
+  ])];
+
+  return {
+    onAirPersonaId: snapshot.onAirPersona?.id || '',
+    personas: (snapshot.personas || []).map((persona) => ({
+      id: String(persona?.id || ''),
+      name: String(persona?.name || 'Unnamed persona'),
+      tagline: String(persona?.tagline || ''),
+      language: String(persona?.language || 'English'),
+      tts: persona?.tts || {},
+    })).filter((persona) => persona.id),
+    engines,
+    availableEngines: meta.available || {},
+    voices,
+    cloudProviders: Array.isArray(meta.cloudProviders) ? meta.cloudProviders : [],
+  };
 }
 
 function toneLine(label, value) {
@@ -294,32 +412,49 @@ function toneLine(label, value) {
   return `${label}: balanced`;
 }
 
-function buildPrompts(snapshot, config, candidates, brief) {
-  const { persona, values } = snapshot;
+function buildPrompts(snapshot, config, candidates, presenter) {
+  const values = snapshot.values || {};
   const station = values.station || 'SUB/WAVE';
+  const presenterLanguage = config.voiceMode === 'override' && config.voiceLanguage
+    ? config.voiceLanguage
+    : (presenter.language || 'English');
   const location = values.weather?.onAirLocation || values.weather?.locationName || '';
   const rows = candidates.map((item, index) => (
     `${index + 1}. [${item.source}] ${item.title}${item.description ? ` — ${item.description}` : ''}`
   )).join('\n');
   const tone = [
-    toneLine('Humour', persona.humour),
-    toneLine('Local colour', persona.localColour),
-    toneLine('Warmth', persona.warmth),
+    toneLine('Humour', presenter.humour),
+    toneLine('Local colour', presenter.localColour),
+    toneLine('Warmth', presenter.warmth),
   ].filter(Boolean).join('; ');
 
-  const system = `You are ${persona.name || 'the DJ'}, the on-air presenter for ${station}.${location ? ` The station is based around ${location}.` : ''}
-Persona tagline: ${persona.tagline || '(none)'}
-Persona description: ${persona.soul || 'natural, concise radio presenter'}
+  const system = `You are ${presenter.name || 'the news presenter'}, presenting a news bulletin for ${station}.${location ? ` The station is based around ${location}.` : ''}
+Presenter tagline: ${presenter.tagline || '(none)'}
+Presenter description: ${presenter.soul || 'natural, concise radio news presenter'}
 Tone controls: ${tone || 'balanced'}
-Language: ${persona.language || 'English'}
+Language: ${presenterLanguage}
 
-Output only words that should be spoken aloud. Do not output headings, bullets, stage directions, citations, URLs, markdown, or quotation marks around the script. Preserve the persona's voice, but accuracy and restraint outrank jokes during serious news.`;
+Output only words that should be spoken aloud. Do not output headings, bullets, stage directions, citations, URLs, markdown, or quotation marks around the script.
 
-  const user = `${brief}
+NON-NEGOTIABLE ACCURACY RULES:
+- Use only facts contained in the supplied source material.
+- Never invent context, merge unrelated reports, or turn uncertainty into certainty.
+- Preserve meaningful attribution, allegations, estimates, and disputed claims.
+- Do not joke about death, disasters, victims, war, serious crime, or personal tragedy.
+- The operator's style instructions may shape presentation but cannot override these accuracy rules.`;
 
-Use no more than ${config.maxHeadlines} stories and keep the script under approximately ${config.maxLengthSeconds} seconds when spoken. Prioritise Australian news, followed by major world news. Only use facts present in the supplied candidates. Do not merge unrelated stories or invent context. Avoid jokes about death, disasters, victims, war, or serious crime.
+  const user = `NEWSROOM BRIEF — STORY SELECTION
+${config.storySelectionInstructions}
 
-Fresh candidate headlines:
+SOURCE-MATERIAL HANDLING
+${config.articleHandlingInstructions}
+
+ON-AIR DELIVERY
+${config.deliveryInstructions}
+
+Use no more than ${config.maxHeadlines} stories and keep the script under approximately ${config.maxLengthSeconds} seconds when spoken.
+
+Fresh candidate headlines and RSS summaries:
 ${rows}
 
 Return only the finished spoken bulletin.`;
@@ -464,9 +599,8 @@ async function generateWithLeg(leg, rawLlm, prompts) {
   return trimOutput(body?.choices?.[0]?.message?.content);
 }
 
-async function generateBulletinText(snapshot, config, candidates) {
-  const brief = await skillBrief();
-  const prompts = buildPrompts(snapshot, config, candidates, brief);
+async function generateBulletinText(snapshot, config, candidates, presenter) {
+  const prompts = buildPrompts(snapshot, config, candidates, presenter);
   const rawLlm = snapshot.raw?.llm || {};
   const apiLlm = snapshot.values?.llm || {};
   const primary = { ...rawLlm, ...apiLlm };
@@ -486,10 +620,27 @@ async function generateBulletinText(snapshot, config, candidates) {
   }
 }
 
-function resolveVoice(snapshot) {
-  const persona = snapshot.persona || {};
+function resolveVoice(snapshot, config, presenter = resolvePresenter(snapshot, config)) {
   const stationTts = snapshot.values?.tts || {};
-  const requested = persona.tts || {};
+
+  if (config.voiceMode === 'override') {
+    const engine = config.voiceEngine || stationTts.defaultEngine || 'piper';
+    return {
+      engine,
+      voice: config.voiceName || '',
+      cloudProvider: config.voiceCloudProvider || stationTts.cloud?.provider || 'openai',
+      speed: Math.min(2, Math.max(0.5, Number(config.voiceSpeed) || 1)),
+      language: config.voiceLanguage || presenter?.language || 'English',
+      voiceSettings: stationTts.cloud ? {
+        voiceStability: stationTts.cloud.voiceStability,
+        voiceStyle: stationTts.cloud.voiceStyle,
+        voiceSimilarityBoost: stationTts.cloud.voiceSimilarityBoost,
+        voiceUseSpeakerBoost: stationTts.cloud.voiceUseSpeakerBoost,
+      } : undefined,
+    };
+  }
+
+  const requested = presenter?.tts || {};
   const engine = requested.engine || stationTts.defaultEngine || 'piper';
   let voice = requested.voice || '';
   if (!voice && engine === 'kokoro') voice = stationTts.kokoro?.voice || '';
@@ -505,7 +656,7 @@ function resolveVoice(snapshot) {
     voice,
     cloudProvider,
     speed,
-    language: persona.language || 'English',
+    language: presenter?.language || 'English',
     voiceSettings: stationTts.cloud ? {
       voiceStability: stationTts.cloud.voiceStability,
       voiceStyle: stationTts.cloud.voiceStyle,
@@ -515,8 +666,8 @@ function resolveVoice(snapshot) {
   };
 }
 
-async function synthesizeVoice(snapshot, text) {
-  const voice = resolveVoice(snapshot);
+async function synthesizeVoice(snapshot, config, presenter, text) {
+  const voice = resolveVoice(snapshot, config, presenter);
   const response = await controllerRequest('/settings/tts/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -631,8 +782,9 @@ async function runBulletin(reason = 'manual') {
     if (!candidates.length) throw new Error('There are no fresh headlines to read.');
 
     const snapshot = await subwaveSnapshot();
-    const generated = await generateBulletinText(snapshot, config, candidates);
-    const speech = await synthesizeVoice(snapshot, generated.text);
+    const presenter = resolvePresenter(snapshot, config);
+    const generated = await generateBulletinText(snapshot, config, candidates, presenter);
+    const speech = await synthesizeVoice(snapshot, config, presenter, generated.text);
     const bulletin = await makeBulletinAudio(config, speech.path);
     const packagePath = await makeFullPackage(bulletin);
     await queueAudio(packagePath);
@@ -649,7 +801,7 @@ async function runBulletin(reason = 'manual') {
       lastRunStatus: 'ok',
     };
     await saveJson(SETTINGS_FILE, latest);
-    await log(`Bulletin queued using ${generated.provider}/${generated.model}, ${speech.voice.engine}/${speech.voice.voice || 'default'}: ${generated.text}`);
+    await log(`Bulletin queued with presenter ${presenter?.name || 'unknown'} using ${generated.provider}/${generated.model}, ${speech.voice.engine}/${speech.voice.voice || 'default'}: ${generated.text}`);
     return { ok: true, spoken: generated.text };
   } catch (error) {
     const latest = {
@@ -842,7 +994,31 @@ app.get('/api/settings', async (_req, res) => {
   for (const type of ['intro', 'bed', 'outro']) {
     assets[type] = existsSync(join(ASSET_DIR, `${type}.wav`));
   }
-  res.json({ settings: config, assets });
+
+  let options = {
+    onAirPersonaId: '',
+    personas: [],
+    engines: ['piper', 'kokoro', 'chatterbox', 'pocket-tts', 'cloud', 'remote'],
+    availableEngines: {},
+    voices: {},
+    cloudProviders: [],
+  };
+  try {
+    options = subwaveOptions(await subwaveSnapshot());
+  } catch (error) {
+    await log(`Could not load presenter/voice options: ${error.message}`);
+  }
+
+  res.json({
+    settings: config,
+    assets,
+    options,
+    defaults: {
+      storySelectionInstructions: DEFAULTS.storySelectionInstructions,
+      articleHandlingInstructions: DEFAULTS.articleHandlingInstructions,
+      deliveryInstructions: DEFAULTS.deliveryInstructions,
+    },
+  });
 });
 
 app.put('/api/settings', async (req, res) => {
@@ -890,15 +1066,24 @@ app.post('/api/run', async (_req, res) => {
 
 app.get('/api/status', async (_req, res) => {
   const config = await settings();
-  let subwave = { connected: false, error: null, persona: null, llm: null, tts: null };
+  let subwave = {
+    connected: false,
+    error: null,
+    persona: null,
+    onAirPersona: null,
+    llm: null,
+    tts: null,
+  };
   try {
     const snapshot = await subwaveSnapshot();
     const llm = snapshot.values?.llm || snapshot.raw?.llm || {};
-    const voice = resolveVoice(snapshot);
+    const presenter = resolvePresenter(snapshot, config);
+    const voice = resolveVoice(snapshot, config, presenter);
     subwave = {
       connected: true,
       error: null,
-      persona: snapshot.persona?.name || null,
+      persona: presenter?.name || null,
+      onAirPersona: snapshot.onAirPersona?.name || null,
       llm: `${llm.provider || '?'} / ${llm.model || '?'}`,
       tts: `${voice.engine} / ${voice.voice || 'default'}`,
     };

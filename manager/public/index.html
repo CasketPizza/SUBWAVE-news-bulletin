@@ -12,7 +12,7 @@
       <div>
         <p class="eyebrow">STANDALONE SUB/WAVE COMPANION</p>
         <h1>Hourly News Bulletin</h1>
-        <p class="lede">Intro jingle, headlines over a music bed, then an outro—using the active SUB/WAVE persona, LLM and voice.</p>
+        <p class="lede">Intro jingle, headlines over a music bed, then an outro—using SUB/WAVE’s LLM with a configurable news presenter, voice and newsroom brief.</p>
         <p class="safe-note">This companion does not patch or replace any SUB/WAVE application files. It is mounted at /news-bulletin/ through a reversible Caddy overlay.</p>
       </div>
       <button id="runNow" class="primary">Run bulletin now</button>
@@ -26,7 +26,7 @@
         <div><span>Manager</span><strong id="managerStatus">Loading…</strong></div>
         <div><span>Extension</span><strong id="versionStatus">Loading…</strong></div>
         <div><span>SUB/WAVE</span><strong id="subwaveStatus">Loading…</strong></div>
-        <div><span>On-air persona</span><strong id="personaStatus">Loading…</strong></div>
+        <div><span>News presenter</span><strong id="personaStatus">Loading…</strong></div>
         <div><span>LLM</span><strong id="llmStatus">Loading…</strong></div>
         <div><span>Voice</span><strong id="ttsStatus">Loading…</strong></div>
         <div class="wide"><span>Last bulletin</span><strong id="lastRun">Never</strong></div>
@@ -57,6 +57,74 @@
         </label>
       </div>
       <p class="hint">A portable companion cannot receive an “hourly announcement finished” event from SUB/WAVE, so the default uses :01. Liquidsoap’s foreground queue keeps the bulletin behind anything already queued.</p>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <div>
+          <h2>Newsroom & presenter</h2>
+          <p>Control which SUB/WAVE personality writes the bulletin, which voice reads it, and the instructions given to the LLM.</p>
+        </div>
+        <button id="resetInstructions" type="button">Reset instruction defaults</button>
+      </div>
+
+      <div class="grid two newsroom-routing">
+        <label>News presenter
+          <select id="presenterSelect">
+            <option value="on-air">Follow the current on-air persona</option>
+          </select>
+          <small class="field-help">Choose a fixed SUB/WAVE persona to create a dedicated news host. Its persona description and tone controls shape the script.</small>
+        </label>
+
+        <label>Voice routing
+          <select id="voiceMode">
+            <option value="presenter">Use the selected presenter’s configured voice</option>
+            <option value="override">Override with another voice</option>
+          </select>
+          <small class="field-help">A voice override changes the sound only; the selected presenter still controls writing style.</small>
+        </label>
+      </div>
+
+      <div id="voiceOverride" class="voice-override hidden">
+        <div class="grid four">
+          <label>TTS engine
+            <select id="voiceEngine"></select>
+          </label>
+          <label>Voice
+            <input id="voiceName" type="text" list="voiceNames" placeholder="Voice name or ID">
+            <datalist id="voiceNames"></datalist>
+          </label>
+          <label id="cloudProviderLabel">Cloud provider
+            <select id="voiceCloudProvider"></select>
+          </label>
+          <label>Speech speed
+            <input id="voiceSpeed" type="number" min="0.5" max="2" step="0.05">
+          </label>
+        </div>
+        <label class="compact-field">Spoken language
+          <input id="voiceLanguage" type="text" placeholder="Use presenter language">
+        </label>
+        <p class="hint">The list is populated from voices SUB/WAVE already knows about. A voice name or ID can also be typed manually for engines that accept one.</p>
+      </div>
+
+      <div class="instruction-stack">
+        <label>Story selection instructions
+          <textarea id="storySelectionInstructions" rows="5" maxlength="6000"></textarea>
+          <small class="field-help">What deserves inclusion, which regions or topics matter most, and what should be left out.</small>
+        </label>
+
+        <label>Source-material handling
+          <textarea id="articleHandlingInstructions" rows="6" maxlength="6000"></textarea>
+          <small class="field-help">How the model should interpret, attribute and paraphrase the RSS headlines and summaries it receives.</small>
+        </label>
+
+        <label>On-air delivery instructions
+          <textarea id="deliveryInstructions" rows="6" maxlength="6000"></textarea>
+          <small class="field-help">Pacing, formality, transitions, pronunciation guidance, opening and closing style.</small>
+        </label>
+      </div>
+
+      <p class="hard-rule">Accuracy safeguards remain enforced even when these instructions are customised: the bulletin cannot invent facts, merge unrelated reports, or turn allegations and uncertainty into certainty.</p>
     </section>
 
     <section>
