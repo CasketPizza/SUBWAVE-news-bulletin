@@ -16,6 +16,8 @@ if [[ -n "$_PRESET_SUBWAVE_STATE_DIR" ]]; then SUBWAVE_STATE_DIR="$_PRESET_SUBWA
 SUBWAVE_STATE_DIR="${SUBWAVE_STATE_DIR:-$SUBWAVE_DIR/state}"
 if [[ -n "$_PRESET_DATA_DIR" ]]; then DATA_DIR="$_PRESET_DATA_DIR"; fi
 DATA_DIR="${DATA_DIR:-$SUBWAVE_STATE_DIR/extensions/hourly-news}"
+SUBWAVE_CONTROLLER_NETWORK="${SUBWAVE_CONTROLLER_NETWORK:-${SUBWAVE_NETWORK:-}}"
+SUBWAVE_CADDY_NETWORK="${SUBWAVE_CADDY_NETWORK:-${SUBWAVE_NETWORK:-}}"
 
 say() { printf '\n\033[1;35m%s\033[0m\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -26,6 +28,21 @@ compose() {
 
 controller_id() {
   (cd "$SUBWAVE_DIR" && docker compose ps -q controller)
+}
+
+ensure_caddy_network() {
+  local id
+  id="$(compose ps -q news-bulletin-manager)"
+  [[ -n "$id" ]] || die "The News Bulletin Manager container is not running."
+  [[ -n "$SUBWAVE_CADDY_NETWORK" ]] || die "SUBWAVE_CADDY_NETWORK is missing from $EXTENSION_DIR/.env"
+
+  if [[ "$SUBWAVE_CADDY_NETWORK" != "$SUBWAVE_CONTROLLER_NETWORK" ]]; then
+    docker network connect --alias subwave-news-bulletin "$SUBWAVE_CADDY_NETWORK" "$id" 2>/dev/null || {
+      docker inspect "$id" --format '{{json .NetworkSettings.Networks}}' \
+        | grep -Fq "\"$SUBWAVE_CADDY_NETWORK\"" \
+        || die "Could not attach the manager to Caddy's network: $SUBWAVE_CADDY_NETWORK"
+    }
+  fi
 }
 
 install_skill_files() {
@@ -75,6 +92,7 @@ update_worker() {
   install_skill_files
   compose build news-bulletin-manager
   compose up -d --force-recreate news-bulletin-manager
+  ensure_caddy_network
   install_proxy
   sleep 3
   rescan_skill
@@ -91,6 +109,7 @@ rollback_worker() {
   install_skill_files
   compose build news-bulletin-manager
   compose up -d --force-recreate news-bulletin-manager
+  ensure_caddy_network
   install_proxy
   sleep 3
   rescan_skill
@@ -99,6 +118,11 @@ rollback_worker() {
 case "${1:-status}" in
   status)
     compose ps
+    printf '\nContainer networks:\n'
+    id="$(compose ps -q news-bulletin-manager)"
+    if [[ -n "$id" ]]; then
+      docker inspect "$id" --format '{{range $name, $cfg := .NetworkSettings.Networks}}  - {{$name}}{{"\n"}}{{end}}'
+    fi
     printf '\nProxy route:\n'
     curl -fsS "http://127.0.0.1:${CADDY_PORT:-7700}/news-bulletin/health" 2>/dev/null \
       || printf 'not reachable through local Caddy\n'
@@ -114,7 +138,11 @@ case "${1:-status}" in
     ;;
   restart)
     compose up -d --force-recreate news-bulletin-manager
+    ensure_caddy_network
     refresh_proxy
+    ;;
+  ensure-network)
+    ensure_caddy_network
     ;;
   refresh-proxy)
     say "Refreshing the /news-bulletin/ route from the current SUB/WAVE Caddy image"
@@ -129,7 +157,7 @@ case "${1:-status}" in
     printf 'The SUB/WAVE skill was kept. Remove it from Admin → Skills when desired.\n'
     ;;
   *)
-    echo "Usage: ./manage.sh {status|update|rollback|restart|refresh-proxy|uninstall}"
+    echo "Usage: ./manage.sh {status|update|rollback|restart|ensure-network|refresh-proxy|uninstall}"
     exit 2
     ;;
 esac
