@@ -2,7 +2,36 @@
 
 A standalone companion for [SUB/WAVE](https://github.com/perminder-klair/subwave).
 It adds an hourly multi-source news bulletin without patching, rebuilding, or
-replacing any SUB/WAVE application files.
+replacing SUB/WAVE application code.
+
+## Normal address
+
+The manager is mounted below the same address already used for SUB/WAVE:
+
+```text
+/news-bulletin/
+```
+
+Examples:
+
+```text
+http://192.168.1.196:7700/news-bulletin/
+http://subwave:7700/news-bulletin/
+https://radio.example.com/news-bulletin/
+```
+
+Nothing is hard-coded to one IP. Changing the station's LAN address, hostname,
+or public domain changes the full URL automatically because only the relative
+path is stored.
+
+The custom skill also displays this instruction near the top of its brief:
+
+```text
+ADVANCED CONFIGURATION: Open /news-bulletin/ on the same address you use for SUB/WAVE.
+```
+
+SUB/WAVE currently renders custom-skill briefs as plain text, so the path is
+visible in the skill editor but is not a clickable custom button.
 
 ## What it does
 
@@ -14,8 +43,7 @@ replacing any SUB/WAVE application files.
 - Mixes the voice over the background bed with adjustable level and fades
 - Queues one complete foreground package through SUB/WAVE's existing `say.txt`
   handoff
-- Provides a LAN web UI for settings, uploads, run-now testing, updates, and
-  rollback
+- Provides settings, uploads, run-now testing, updates, and rollback
 
 ## Default on-air sequence
 
@@ -35,29 +63,45 @@ The schedule may instead be set to:
 - Manual only
 
 There is no “replace the native hourly announcement” option because doing that
-would require changing SUB/WAVE itself.
+would require changing SUB/WAVE's scheduler.
 
 ## What it changes
 
-It writes only persistent operator data:
+It writes persistent operator data to:
 
 ```text
 SUBWAVE_STATE/skills/hourly-news-bulletin/
 SUBWAVE_STATE/extensions/hourly-news/
 ```
 
-It also starts one separate Docker container named:
+It starts one separate Docker container:
 
 ```text
 subwave-news-bulletin
 ```
 
-It does **not** copy source files into the SUB/WAVE controller, alter the SUB/WAVE
-web UI, patch the scheduler, or rebuild any SUB/WAVE image.
+To place the manager on the normal SUB/WAVE address, it also installs a small,
+reversible Docker Compose overlay for the existing Caddy service. The overlay:
+
+- Mounts a generated Caddyfile at `/etc/caddy/Caddyfile`
+- Adds only the `/news-bulletin/` reverse-proxy route
+- Is generated from the Caddyfile inside the currently installed SUB/WAVE Caddy
+  image, rather than shipping a frozen copy
+- Is recorded in SUB/WAVE's `.env` through `COMPOSE_FILE`
+- Preserves any existing `docker-compose.override.yml`
+- Is removed cleanly by `./manage.sh uninstall`
+
+No SUB/WAVE TypeScript, JavaScript, scheduler, controller, web, Liquidsoap, or
+image source is edited. SUB/WAVE's own Caddy image explicitly supports replacing
+`/etc/caddy/Caddyfile` with an operator mount.
+
+The manager checks for a changed SUB/WAVE Caddy image every five minutes. When it
+finds one, it regenerates the overlay from that image and hot-reloads Caddy, so
+upstream proxy changes are retained.
 
 ## Install
 
-Run these on the Ubuntu machine that already runs SUB/WAVE:
+Run these commands on the Ubuntu machine that already runs SUB/WAVE:
 
 ```bash
 cd ~
@@ -77,14 +121,9 @@ For a non-default SUB/WAVE directory:
 SUBWAVE_DIR=/path/to/subwave ./install.sh
 ```
 
-When installation completes, open:
-
-```text
-http://YOUR-SUBWAVE-IP:7711
-```
-
-The page uses the same HTTP Basic username and password as the SUB/WAVE admin
-page.
+When installation completes, open `/news-bulletin/` on the same address used for
+SUB/WAVE. The page uses the same HTTP Basic username and password as the
+SUB/WAVE admin page.
 
 ## First setup
 
@@ -103,18 +142,8 @@ M4A, and other FFmpeg-readable audio formats are accepted.
 ## LLM compatibility
 
 The companion follows SUB/WAVE's saved provider/model settings. Supported
-providers are:
-
-- Ollama
-- OpenAI
-- OpenAI-compatible
-- Locca
-- Anthropic
-- Google Gemini
-- DeepSeek
-- OpenRouter
-- Requesty
-- Gateway when a compatible base URL is configured
+providers include Ollama, OpenAI, OpenAI-compatible, Locca, Anthropic, Google
+Gemini, DeepSeek, OpenRouter, Requesty, and compatible Gateway endpoints.
 
 API keys are read from the same environment and persistent `secrets.env` used by
 SUB/WAVE. OpenAI-compatible inline keys are read from SUB/WAVE's persistent
@@ -127,17 +156,17 @@ active persona's engine, voice, language, and speed. That supports whichever TTS
 engines the installed SUB/WAVE controller already supports, including custom
 Piper voices.
 
-## Updating in the UI
+## Updating
 
-Open the manager page and use:
+Use the manager page:
 
 ```text
 Check for updates → Update now
 ```
 
-The updater changes only this companion repository and companion container. It
-preserves feeds, schedule settings, seen-headline history, and all uploaded
-audio under SUB/WAVE's persistent state directory.
+The updater changes only this companion repository, companion container, skill
+files, and its reversible Caddy overlay. It preserves feeds, schedule settings,
+seen-headline history, and uploaded audio under SUB/WAVE's persistent state.
 
 Use **Roll back** to return to the previously installed companion commit.
 
@@ -149,22 +178,24 @@ cd ~/SUBWAVE-news-bulletin
 ./manage.sh update
 ./manage.sh rollback
 ./manage.sh restart
+./manage.sh refresh-proxy
 ./manage.sh uninstall
 ```
 
-`uninstall` removes the companion container while preserving settings and audio.
-The custom skill can be removed separately from **Admin → Skills**.
+`uninstall` removes the `/news-bulletin/` Caddy route, restores the previous
+Compose file list, and removes the companion container. Settings and audio are
+kept. The custom skill can be removed separately from **Admin → Skills**.
 
 ## Security
 
-The manager is intended for a trusted home LAN. It uses SUB/WAVE's admin Basic
-Auth and has the Docker socket mounted so the UI can update its own container.
-Do not expose port `7711` publicly without an additional access-control layer.
+The manager uses SUB/WAVE's admin Basic Auth. Because it is now on the same
+origin, any Cloudflare Tunnel or reverse proxy that exposes the complete SUB/WAVE
+host also exposes `/news-bulletin/`. Protect the admin surface with Cloudflare
+Access or another access-control layer when the station is internet-facing.
 
 ## Native skill fallback
 
 The installer adds a normal custom skill named **Hourly multi-source news
 bulletin**. Keep it disabled to avoid duplicate autonomous bulletins. Its
-SUB/WAVE **Run now** action remains available as a plain spoken fallback, but the
-separate manager page is what supplies the intro, background bed, outro, and
-portable scheduler.
+SUB/WAVE **Run now** action remains available as a plain spoken fallback; the
+manager page supplies the intro, background bed, outro, and portable scheduler.

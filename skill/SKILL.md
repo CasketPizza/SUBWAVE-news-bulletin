@@ -5,6 +5,10 @@ cooldown: 55m
 context: date, clock, time, show, listeners
 tags: news, rss, hourly, bulletin
 ---
+ADVANCED CONFIGURATION: Open /news-bulletin/ on the same address you use for
+SUB/WAVE. The path automatically follows the station's IP address, hostname, or
+HTTPS domain.
+
 Deliver a compact radio news bulletin from the supplied fresh headlines.
 
 Select three to five genuinely important stories. Prioritise Australian news,

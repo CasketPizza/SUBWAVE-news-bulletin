@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SUB/WAVE Hourly News</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <main>
@@ -13,7 +13,7 @@
         <p class="eyebrow">STANDALONE SUB/WAVE COMPANION</p>
         <h1>Hourly News Bulletin</h1>
         <p class="lede">Intro jingle, headlines over a music bed, then an outro—using the active SUB/WAVE persona, LLM and voice.</p>
-        <p class="safe-note">This companion does not patch or replace any SUB/WAVE application files.</p>
+        <p class="safe-note">This companion does not patch or replace any SUB/WAVE application files. It is mounted at /news-bulletin/ through a reversible Caddy overlay.</p>
       </div>
       <button id="runNow" class="primary">Run bulletin now</button>
     </header>
@@ -35,6 +35,7 @@
         <button id="checkUpdate">Check for updates</button>
         <button id="updateNow">Update now</button>
         <button id="rollback">Roll back</button>
+        <button id="refreshProxy">Refresh SUB/WAVE path</button>
       </div>
     </section>
 
@@ -132,6 +133,6 @@
       <pre id="logs">Loading…</pre>
     </section>
   </main>
-  <script src="/app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

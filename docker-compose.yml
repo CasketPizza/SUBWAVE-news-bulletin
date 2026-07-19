@@ -5,17 +5,18 @@ services:
       context: ./manager
     container_name: subwave-news-bulletin
     restart: unless-stopped
-    ports:
-      - "${MANAGER_PORT:-7711}:7711"
+    expose:
+      - "7711"
     env_file:
       - "${SUBWAVE_DIR}/.env"
     environment:
       PORT: "7711"
       EXTENSION_DIR: "${EXTENSION_DIR}"
+      SUBWAVE_DIR: "${SUBWAVE_DIR}"
       STATE_DIR: "/var/sub-wave"
       HOST_STATE_DIR: "${SUBWAVE_STATE_DIR}"
       SUBWAVE_NETWORK: "${SUBWAVE_NETWORK}"
-      MANAGER_PORT: "${MANAGER_PORT:-7711}"
+      MANAGER_PORT: "7711"
       MANAGER_IMAGE: "subwave-news-bulletin-manager:local"
       CONTROLLER_URL: "http://controller:7701"
       TZ: "${TZ:-Australia/Sydney}"
@@ -23,6 +24,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "${EXTENSION_DIR}:${EXTENSION_DIR}"
+      - "${SUBWAVE_DIR}:${SUBWAVE_DIR}"
       - "${SUBWAVE_STATE_DIR}:/var/sub-wave"
     extra_hosts:
       - "host.docker.internal:host-gateway"

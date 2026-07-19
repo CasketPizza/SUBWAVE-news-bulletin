@@ -11,6 +11,8 @@ import { basename, join, resolve } from 'node:path';
 
 const PORT = Number(process.env.PORT || 7711);
 const EXTENSION_DIR = resolve(process.env.EXTENSION_DIR || '/opt/subwave-news-bulletin');
+const SUBWAVE_DIR = resolve(process.env.SUBWAVE_DIR || '/opt/subwave');
+const PROXY_REFRESH_SCRIPT = join(EXTENSION_DIR, 'proxy/refresh_proxy.sh');
 const STATE_DIR = resolve(process.env.STATE_DIR || '/var/sub-wave');
 const HOST_STATE_DIR = process.env.HOST_STATE_DIR || STATE_DIR;
 const SUBWAVE_NETWORK = process.env.SUBWAVE_NETWORK || '';
@@ -771,9 +773,11 @@ function updaterContainer(command) {
     'run', '-d', '--rm', '--name', name,
     '-v', '/var/run/docker.sock:/var/run/docker.sock',
     '-v', `${EXTENSION_DIR}:${EXTENSION_DIR}`,
+    '-v', `${SUBWAVE_DIR}:${SUBWAVE_DIR}`,
     '-v', `${HOST_STATE_DIR}:/var/sub-wave`,
     '-w', EXTENSION_DIR,
     '-e', `EXTENSION_DIR=${EXTENSION_DIR}`,
+    '-e', `SUBWAVE_DIR=${SUBWAVE_DIR}`,
     '-e', 'SUBWAVE_STATE_DIR=/var/sub-wave',
     '-e', 'DATA_DIR=/var/sub-wave/extensions/hourly-news',
     '-e', `SUBWAVE_NETWORK=${SUBWAVE_NETWORK}`,
@@ -789,6 +793,42 @@ function updaterContainer(command) {
 async function rescanSkill() {
   await controllerRequest('/dj/skills/rescan', { method: 'POST' });
 }
+
+let proxyRefreshBusy = false;
+async function refreshProxyRoute(force = false) {
+  if (proxyRefreshBusy || !existsSync(PROXY_REFRESH_SCRIPT)) return { ok: false, skipped: true };
+  proxyRefreshBusy = true;
+  try {
+    const args = [PROXY_REFRESH_SCRIPT];
+    if (force) args.push('--force');
+    const result = spawnSync('bash', args, {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        EXTENSION_DIR,
+        SUBWAVE_DIR,
+        SUBWAVE_NETWORK,
+      },
+    });
+    if (result.status !== 0) {
+      throw new Error((result.stderr || result.stdout || 'proxy refresh failed').trim());
+    }
+    const message = (result.stdout || '').trim();
+    if (message) await log(message);
+    return { ok: true, message };
+  } catch (error) {
+    await log(`Proxy refresh warning: ${error.message}`);
+    return { ok: false, error: error.message };
+  } finally {
+    proxyRefreshBusy = false;
+  }
+}
+
+// SUB/WAVE's Caddy image can change independently of this companion. Rebuild
+// the generated overlay from the new image automatically, then hot-reload Caddy.
+setInterval(() => {
+  refreshProxyRoute(false).catch(() => {});
+}, 5 * 60 * 1000);
 
 const app = express();
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -884,6 +924,12 @@ app.get('/api/logs', async (_req, res) => {
   }
 });
 
+app.post('/api/proxy/refresh', async (_req, res) => {
+  const result = await refreshProxyRoute(true);
+  if (!result.ok) return res.status(500).json({ error: result.error || 'Proxy refresh failed.' });
+  res.json({ ok: true, message: result.message || 'Proxy route refreshed.' });
+});
+
 app.post('/api/update', (_req, res) => {
   try {
     updaterContainer('update-worker');
@@ -903,6 +949,7 @@ app.post('/api/rollback', (_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  log(`Hourly News Manager listening on port ${PORT}. No SUB/WAVE source files are modified.`).catch(() => {});
+  log(`Hourly News Manager listening internally on port ${PORT}; public path is /news-bulletin/. No SUB/WAVE source files are modified.`).catch(() => {});
   rescanSkill().catch((error) => log(`Skill rescan warning: ${error.message}`));
+  refreshProxyRoute(false).catch(() => {});
 });

@@ -21,13 +21,48 @@ say() { printf '\n\033[1;35m%s\033[0m\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 compose() {
-  docker compose --env-file "$EXTENSION_DIR/.env" -f "$EXTENSION_DIR/docker-compose.yml" "$@"
+  COMPOSE_FILE= docker compose --env-file "$EXTENSION_DIR/.env" -f "$EXTENSION_DIR/docker-compose.yml" "$@"
+}
+
+controller_id() {
+  (cd "$SUBWAVE_DIR" && docker compose ps -q controller)
 }
 
 install_skill_files() {
-  mkdir -p "$SUBWAVE_STATE_DIR/skills/hourly-news-bulletin"
-  cp "$EXTENSION_DIR/skill/SKILL.md" "$SUBWAVE_STATE_DIR/skills/hourly-news-bulletin/SKILL.md"
-  cp "$EXTENSION_DIR/skill/tool.mjs" "$SUBWAVE_STATE_DIR/skills/hourly-news-bulletin/tool.mjs"
+  local id
+  id="$(controller_id)"
+  [[ -n "$id" ]] || die "The SUB/WAVE controller container is not running."
+  docker exec "$id" mkdir -p /var/sub-wave/skills/hourly-news-bulletin
+  docker cp "$EXTENSION_DIR/skill/SKILL.md" "$id:/var/sub-wave/skills/hourly-news-bulletin/SKILL.md"
+  docker cp "$EXTENSION_DIR/skill/tool.mjs" "$id:/var/sub-wave/skills/hourly-news-bulletin/tool.mjs"
+}
+
+rescan_skill() {
+  local id
+  id="$(controller_id)"
+  [[ -n "$id" ]] || return 0
+  docker exec -i "$id" node - <<'NODE' || true
+(async () => {
+  const auth = 'Basic ' + Buffer.from(`${process.env.ADMIN_USER || ''}:${process.env.ADMIN_PASS || ''}`).toString('base64');
+  const response = await fetch('http://127.0.0.1:7701/dj/skills/rescan', {
+    method: 'POST',
+    headers: { Authorization: auth },
+  });
+  console.log(await response.text());
+})().catch(console.error);
+NODE
+}
+
+install_proxy() {
+  bash "$EXTENSION_DIR/proxy/install_proxy.sh"
+}
+
+refresh_proxy() {
+  bash "$EXTENSION_DIR/proxy/refresh_proxy.sh" --force
+}
+
+remove_proxy() {
+  bash "$EXTENSION_DIR/proxy/remove_proxy.sh"
 }
 
 update_worker() {
@@ -40,6 +75,9 @@ update_worker() {
   install_skill_files
   compose build news-bulletin-manager
   compose up -d --force-recreate news-bulletin-manager
+  install_proxy
+  sleep 3
+  rescan_skill
 }
 
 rollback_worker() {
@@ -53,11 +91,18 @@ rollback_worker() {
   install_skill_files
   compose build news-bulletin-manager
   compose up -d --force-recreate news-bulletin-manager
+  install_proxy
+  sleep 3
+  rescan_skill
 }
 
 case "${1:-status}" in
   status)
     compose ps
+    printf '\nProxy route:\n'
+    curl -fsS "http://127.0.0.1:${CADDY_PORT:-7700}/news-bulletin/health" 2>/dev/null \
+      || printf 'not reachable through local Caddy\n'
+    printf '\n'
     ;;
   update|update-worker)
     say "Updating the News Bulletin companion"
@@ -69,15 +114,22 @@ case "${1:-status}" in
     ;;
   restart)
     compose up -d --force-recreate news-bulletin-manager
+    refresh_proxy
+    ;;
+  refresh-proxy)
+    say "Refreshing the /news-bulletin/ route from the current SUB/WAVE Caddy image"
+    refresh_proxy
     ;;
   uninstall)
+    say "Removing the /news-bulletin/ route"
+    remove_proxy
     say "Stopping and removing the companion container"
     compose down
     printf 'Settings and uploaded audio were kept in: %s\n' "$DATA_DIR"
     printf 'The SUB/WAVE skill was kept. Remove it from Admin → Skills when desired.\n'
     ;;
   *)
-    echo "Usage: ./manage.sh {status|update|rollback|restart|uninstall}"
+    echo "Usage: ./manage.sh {status|update|rollback|restart|refresh-proxy|uninstall}"
     exit 2
     ;;
 esac

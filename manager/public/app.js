@@ -3,6 +3,11 @@ let model = null;
 let assets = {};
 let noticeTimer = null;
 
+// The manager is normally reverse-proxied below /news-bulletin/. Resolve every
+// request relative to the page so the same build also works directly at /.
+const APP_BASE = new URL('.', window.location.href).pathname.replace(/\/$/, '');
+const localUrl = (path) => `${APP_BASE}${path.startsWith('/') ? path : `/${path}`}`;
+
 function notice(message, error = false) {
   const box = $('notice');
   box.textContent = message;
@@ -13,7 +18,7 @@ function notice(message, error = false) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetch(localUrl(path), options);
   const type = response.headers.get('content-type') || '';
   const body = type.includes('application/json') ? await response.json() : await response.text();
   if (!response.ok) throw new Error(body?.error || body || `${response.status}`);
@@ -120,7 +125,7 @@ async function removeAsset(type) {
 function previewAsset(type) {
   if (!assets[type]) return notice('No audio has been uploaded for that field.', true);
   const player = $('preview');
-  player.src = `/api/assets/${type}?t=${Date.now()}`;
+  player.src = localUrl(`/api/assets/${type}?t=${Date.now()}`);
   player.classList.remove('hidden');
   player.play();
 }
@@ -182,6 +187,7 @@ $('checkUpdate').onclick = async () => {
 };
 $('updateNow').onclick = () => command('/api/update', 'Update started.').catch((error) => notice(error.message, true));
 $('rollback').onclick = () => command('/api/rollback', 'Rollback started.').catch((error) => notice(error.message, true));
+$('refreshProxy').onclick = () => command('/api/proxy/refresh', 'SUB/WAVE path refreshed.').catch((error) => notice(error.message, true));
 $('refreshLogs').onclick = () => loadLogs().catch((error) => notice(error.message, true));
 
 load().catch((error) => notice(error.message, true));
