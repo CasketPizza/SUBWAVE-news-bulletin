@@ -7,6 +7,7 @@ import {
 } from 'node:fs/promises';
 import fs, { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import net from 'node:net';
 import { basename, join, resolve } from 'node:path';
 
 const PORT = Number(process.env.PORT || 7711);
@@ -25,12 +26,15 @@ const GENERATED_DIR = join(DATA_DIR, 'generated');
 const UPLOAD_DIR = join(DATA_DIR, 'uploads');
 const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 const SEEN_FILE = join(DATA_DIR, 'seen.json');
+const HEADLINES_CACHE_FILE = join(DATA_DIR, 'headlines-cache.json');
 const LOG_FILE = join(DATA_DIR, 'manager.log');
 const SAY_FILE = join(STATE_DIR, 'say.txt');
 const SKILL_FILE = join(STATE_DIR, 'skills/hourly-news-bulletin/SKILL.md');
 const RAW_SUBWAVE_SETTINGS = join(STATE_DIR, 'settings.json');
 const SUBWAVE_SECRETS = join(STATE_DIR, 'secrets.env');
 const GITHUB_REPO = process.env.GITHUB_REPO || 'CasketPizza/SUBWAVE-news-bulletin';
+const LIQUIDSOAP_HOST = process.env.LIQUIDSOAP_HOST || 'broadcast';
+const LIQUIDSOAP_PORT = Number(process.env.LIQUIDSOAP_PORT || 1234);
 
 const DEFAULTS = {
   enabled: true,
@@ -45,13 +49,15 @@ const DEFAULTS = {
   maxCandidates: 12,
   maxHeadlines: 5,
   maxLengthSeconds: 60,
+  storyPauseSeconds: 2.25,
+  interruptCurrentTrack: true,
 
   // Newsroom prompt controls. These are intentionally separate so an operator
   // can change what gets selected, how source material is interpreted, and how
   // the finished bulletin sounds without editing SUB/WAVE's skill file.
   storySelectionInstructions: `Choose the most consequential and genuinely new stories. Prioritise Australian national and local-interest news, then major world developments. Avoid filling the bulletin with several minor stories about the same topic.`,
   articleHandlingInstructions: `Treat each supplied headline and RSS summary as source material, not as wording to copy. Paraphrase accurately, preserve uncertainty and attribution, and never add facts that are not present. Do not merge separate reports into one event. Mention a publication only when attribution materially improves clarity.`,
-  deliveryInstructions: `Sound like a composed radio newsreader. Use complete natural sentences, brief transitions, and an even pace. Begin directly, avoid a long greeting, and finish cleanly without teasing music or saying that links are available.`,
+  deliveryInstructions: `Sound like a composed radio newsreader. Use complete natural sentences and an even pace. Begin directly, avoid a long greeting, and finish cleanly without teasing music or saying that links are available. Treat every story as a clearly separate item: finish one story cleanly before beginning the next, and never use a transition that makes unrelated reports sound connected.`,
 
   // Presenter and voice routing. presenterMode=persona selects a dedicated
   // SUB/WAVE persona for both style and, by default, voice. voiceMode=override
@@ -170,6 +176,8 @@ function cleanSettings(body) {
     maxCandidates: Math.min(30, Math.max(3, Number(input.maxCandidates) || 12)),
     maxHeadlines: Math.min(10, Math.max(1, Number(input.maxHeadlines) || 5)),
     maxLengthSeconds: Math.min(180, Math.max(20, Number(input.maxLengthSeconds) || 60)),
+    storyPauseSeconds: Math.min(6, Math.max(0.5, Number(input.storyPauseSeconds) || DEFAULTS.storyPauseSeconds)),
+    interruptCurrentTrack: input.interruptCurrentTrack !== false,
     storySelectionInstructions: cleanInstruction(
       input.storySelectionInstructions,
       DEFAULTS.storySelectionInstructions,
@@ -256,7 +264,7 @@ async function fetchFeed(feed, maxItems) {
     const response = await fetch(feed.url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'SUBWAVE-News-Bulletin/0.4 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
+        'User-Agent': 'SUBWAVE-News-Bulletin/0.5 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
       },
     });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -264,6 +272,25 @@ async function fetchFeed(feed, maxItems) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function mergeHeadlineBuckets(buckets, limit) {
+  const local = new Set();
+  const merged = [];
+  for (let row = 0; merged.length < limit; row++) {
+    let found = false;
+    for (const bucket of buckets) {
+      const item = bucket[row];
+      if (!item) continue;
+      found = true;
+      const key = hash(item.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim());
+      if (!key || local.has(key)) continue;
+      local.add(key);
+      merged.push({ ...item, key });
+    }
+    if (!found) break;
+  }
+  return merged;
 }
 
 async function collectHeadlines(config) {
@@ -278,27 +305,37 @@ async function collectHeadlines(config) {
       void log(`Feed failed: ${config.feeds[index].name || config.feeds[index].url}: ${result.reason?.message || result.reason}`);
     }
   });
-  if (!buckets.length) throw new Error('All configured news feeds failed or returned no stories.');
+
+  let current = [];
+  let freshness = 'fresh';
+  if (buckets.length) {
+    current = mergeHeadlineBuckets(buckets, config.maxCandidates * 3);
+    await saveJson(HEADLINES_CACHE_FILE, {
+      items: current,
+      updatedAt: new Date().toISOString(),
+    }).catch(() => {});
+  } else {
+    const cached = await loadJson(HEADLINES_CACHE_FILE, { items: [], updatedAt: null });
+    current = Array.isArray(cached.items) ? cached.items : [];
+    freshness = 'cached';
+    if (!current.length) throw new Error('All configured news feeds failed and no previous headline cache is available.');
+    await log(`Using cached headlines from ${cached.updatedAt || 'an earlier successful fetch'}.`);
+  }
+
+  if (!current.length) throw new Error('The configured feeds returned no stories.');
 
   const seenLedger = await loadJson(SEEN_FILE, { keys: [] });
   const old = new Set(Array.isArray(seenLedger.keys) ? seenLedger.keys : []);
-  const local = new Set();
-  const merged = [];
-
-  for (let row = 0; merged.length < config.maxCandidates * 3; row++) {
-    let found = false;
-    for (const bucket of buckets) {
-      const item = bucket[row];
-      if (!item) continue;
-      found = true;
-      const key = hash(item.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim());
-      if (!key || local.has(key) || old.has(key)) continue;
-      local.add(key);
-      merged.push({ ...item, key });
-    }
-    if (!found) break;
+  const fresh = current.filter((item) => !old.has(item.key));
+  let candidates;
+  if (fresh.length) {
+    candidates = fresh.slice(0, config.maxCandidates);
+  } else {
+    candidates = current.slice(0, config.maxCandidates);
+    if (freshness !== 'cached') freshness = 'recap';
   }
-  return { candidates: merged.slice(0, config.maxCandidates), ledger: old };
+
+  return { candidates, ledger: old, freshness };
 }
 
 async function skillBrief() {
@@ -412,7 +449,7 @@ function toneLine(label, value) {
   return `${label}: balanced`;
 }
 
-function buildPrompts(snapshot, config, candidates, presenter) {
+function buildPrompts(snapshot, config, candidates, presenter, freshness = 'fresh') {
   const values = snapshot.values || {};
   const station = values.station || 'SUB/WAVE';
   const presenterLanguage = config.voiceMode === 'override' && config.voiceLanguage
@@ -434,16 +471,26 @@ Presenter description: ${presenter.soul || 'natural, concise radio news presente
 Tone controls: ${tone || 'balanced'}
 Language: ${presenterLanguage}
 
-Output only words that should be spoken aloud. Do not output headings, bullets, stage directions, citations, URLs, markdown, or quotation marks around the script.
+Output only the bulletin script plus the exact control marker [[STORY_BREAK]] between stories. Put that marker on its own line. Do not output headings, bullets, stage directions, citations, URLs, markdown, or quotation marks around the script. The marker is not spoken; it is used to insert broadcast silence.
 
 NON-NEGOTIABLE ACCURACY RULES:
 - Use only facts contained in the supplied source material.
 - Never invent context, merge unrelated reports, or turn uncertainty into certainty.
 - Preserve meaningful attribution, allegations, estimates, and disputed claims.
 - Do not joke about death, disasters, victims, war, serious crime, or personal tragedy.
-- The operator's style instructions may shape presentation but cannot override these accuracy rules.`;
+- The operator's style instructions may shape presentation but cannot override these accuracy rules.
+- Every story must be self-contained and separated from the next with [[STORY_BREAK]]. Never blend two unrelated stories into one paragraph.`;
 
-  const user = `NEWSROOM BRIEF — STORY SELECTION
+  const freshnessNote = freshness === 'fresh'
+    ? 'At least one supplied story has not appeared in an earlier bulletin.'
+    : freshness === 'cached'
+      ? 'The live feeds were unavailable. Use the latest cached source material as a measured recap and do not call any item breaking, new, or just in.'
+      : 'There are no unseen headlines. Still produce a useful latest-news recap from the supplied current feed items. Do not pretend the stories are newly breaking.';
+
+  const user = `NEWSROOM STATUS
+${freshnessNote}
+
+NEWSROOM BRIEF — STORY SELECTION
 ${config.storySelectionInstructions}
 
 SOURCE-MATERIAL HANDLING
@@ -457,7 +504,7 @@ Use no more than ${config.maxHeadlines} stories and keep the script under approx
 Fresh candidate headlines and RSS summaries:
 ${rows}
 
-Return only the finished spoken bulletin.`;
+Return only the finished spoken bulletin, with [[STORY_BREAK]] on its own line between every story.`;
   return { system, user };
 }
 
@@ -472,6 +519,20 @@ function trimOutput(value) {
     .replace(/^(?:script|bulletin|news bulletin)\s*:\s*/i, '')
     .replace(/^['"]|['"]$/g, '')
     .trim();
+}
+
+function splitBulletinStories(value, maxStories) {
+  const cleaned = trimOutput(value)
+    .replace(/\r/g, '')
+    .replace(/^[ \t]*(?:story|headline)\s*\d+\s*[:.-]\s*/gim, '')
+    .trim();
+  let parts = cleaned.split(/\n\s*\[\[STORY_BREAK\]\]\s*\n|\[\[STORY_BREAK\]\]/i);
+  if (parts.length === 1) parts = cleaned.split(/\n\s*\n+/);
+  parts = parts
+    .map((part) => part.replace(/^[\s•*-]+|[\s]+$/g, '').trim())
+    .filter(Boolean)
+    .slice(0, Math.max(1, maxStories));
+  return parts.length ? parts : [cleaned].filter(Boolean);
 }
 
 function providerKey(provider, rawLlm = {}) {
@@ -599,24 +660,45 @@ async function generateWithLeg(leg, rawLlm, prompts) {
   return trimOutput(body?.choices?.[0]?.message?.content);
 }
 
-async function generateBulletinText(snapshot, config, candidates, presenter) {
-  const prompts = buildPrompts(snapshot, config, candidates, presenter);
+async function generateStoriesWithLeg(leg, rawLlm, prompts, config, candidates) {
+  let text = await generateWithLeg(leg, rawLlm, prompts);
+  if (!text) throw new Error('The configured LLM returned an empty bulletin.');
+  let stories = splitBulletinStories(text, config.maxHeadlines);
+
+  // Small/local models occasionally ignore the control marker and return one
+  // continuous paragraph. Retry once before accepting that result: actual audio
+  // gaps are only possible when each story is a separate TTS clip.
+  const expectedMultiple = Math.min(config.maxHeadlines, candidates.length) > 1;
+  if (expectedMultiple && stories.length < 2) {
+    const repairPrompts = {
+      ...prompts,
+      user: `${prompts.user}\n\nFORMAT CORRECTION: Your response must contain at least two clearly separate stories when the source list supports it. Put [[STORY_BREAK]] on its own line between every story. Do not return one continuous paragraph.`,
+    };
+    text = await generateWithLeg(leg, rawLlm, repairPrompts);
+    if (!text) throw new Error('The configured LLM returned an empty bulletin on its format retry.');
+    stories = splitBulletinStories(text, config.maxHeadlines);
+  }
+
+  if (!stories.length) throw new Error('The configured LLM returned no usable stories.');
+  return { text: stories.join(' '), stories };
+}
+
+async function generateBulletinText(snapshot, config, candidates, presenter, freshness) {
+  const prompts = buildPrompts(snapshot, config, candidates, presenter, freshness);
   const rawLlm = snapshot.raw?.llm || {};
   const apiLlm = snapshot.values?.llm || {};
   const primary = { ...rawLlm, ...apiLlm };
   try {
-    const text = await generateWithLeg(primary, rawLlm, prompts);
-    if (!text) throw new Error('The configured LLM returned an empty bulletin.');
-    return { text, provider: primary.provider, model: primary.model };
+    const generated = await generateStoriesWithLeg(primary, rawLlm, prompts, config, candidates);
+    return { ...generated, provider: primary.provider, model: primary.model };
   } catch (primaryError) {
     const fallbackRaw = rawLlm?.fallback || {};
     const fallbackApi = apiLlm?.fallback || {};
     const fallback = { ...fallbackRaw, ...fallbackApi };
     if (!fallback.enabled) throw primaryError;
     await log(`Primary LLM failed; trying fallback: ${primaryError.message}`);
-    const text = await generateWithLeg(fallback, rawLlm, prompts);
-    if (!text) throw new Error('The configured fallback LLM returned an empty bulletin.');
-    return { text, provider: fallback.provider, model: fallback.model };
+    const generated = await generateStoriesWithLeg(fallback, rawLlm, prompts, config, candidates);
+    return { ...generated, provider: fallback.provider, model: fallback.model };
   }
 }
 
@@ -680,6 +762,46 @@ async function synthesizeVoice(snapshot, config, presenter, text) {
   return { path, voice };
 }
 
+async function makeNarrationAudio(config, speechPaths) {
+  if (!speechPaths.length) throw new Error('No speech clips were generated.');
+  const normalized = [];
+  for (let index = 0; index < speechPaths.length; index++) {
+    const out = join(GENERATED_DIR, `story-${Date.now()}-${index}.wav`);
+    run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-i', speechPaths[index], '-ar', '44100', '-ac', '2',
+      '-c:a', 'pcm_s16le', out,
+    ]);
+    normalized.push(out);
+  }
+
+  if (normalized.length === 1) return normalized[0];
+
+  const silence = join(GENERATED_DIR, `story-pause-${Date.now()}.wav`);
+  run('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+    '-t', Number(config.storyPauseSeconds).toFixed(3),
+    '-c:a', 'pcm_s16le', silence,
+  ]);
+
+  const sequence = [];
+  normalized.forEach((path, index) => {
+    sequence.push(path);
+    if (index < normalized.length - 1) sequence.push(silence);
+  });
+  const listPath = join(GENERATED_DIR, `narration-${Date.now()}.txt`);
+  const escaped = sequence.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n');
+  await writeFile(listPath, `${escaped}\n`);
+  const out = join(GENERATED_DIR, `narration-${Date.now()}.wav`);
+  run('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'concat', '-safe', '0', '-i', listPath,
+    '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', out,
+  ]);
+  return out;
+}
+
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', ...options });
   if (result.status !== 0) {
@@ -738,12 +860,18 @@ async function makeFullPackage(bulletinPath) {
   parts.push(bulletinPath);
   if (existsSync(outro)) parts.push(outro);
 
-  const out = join(GENERATED_DIR, `news-package-${Date.now()}.wav`);
-  if (parts.length === 1) {
-    await copyFile(parts[0], out);
-    return out;
-  }
+  // Keep a short silent tail inside the programme item. Liquidsoap begins its
+  // tiny exit crossfade during this tail, so the next song cannot overlap the
+  // final spoken word or the audible end of the outro.
+  const tail = join(GENERATED_DIR, `package-tail-${Date.now()}.wav`);
+  run('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+    '-t', '0.65', '-c:a', 'pcm_s16le', tail,
+  ]);
+  parts.push(tail);
 
+  const out = join(GENERATED_DIR, `news-package-${Date.now()}.wav`);
   const inputs = parts.flatMap((path) => ['-i', path]);
   const labels = parts.map((_, index) => `[${index}:a]`).join('');
   run('ffmpeg', [
@@ -753,6 +881,101 @@ async function makeFullPackage(bulletinPath) {
     '-map', '[out]', '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', out,
   ]);
   return out;
+}
+
+function liquidsoapCommand(command, timeoutMs = 3500) {
+  return new Promise((resolvePromise, reject) => {
+    const socket = net.createConnection({ host: LIQUIDSOAP_HOST, port: LIQUIDSOAP_PORT });
+    let buffer = '';
+    let settled = false;
+    const finish = (error, value = '') => {
+      if (settled) return;
+      settled = true;
+      try { socket.end('quit\n'); } catch {}
+      try { socket.destroy(); } catch {}
+      if (error) reject(error); else resolvePromise(value);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('timeout', () => finish(new Error('Liquidsoap control timed out.')));
+    socket.once('error', (error) => finish(error));
+    socket.once('connect', () => socket.write(`${command}\n`));
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString();
+      if (/END\r?\n/.test(buffer)) finish(null, buffer.replace(/END\r?\n.*$/s, '').trim());
+    });
+    socket.once('close', () => finish(null, buffer.trim()));
+  });
+}
+
+function decodeMetadataValue(raw) {
+  let value = String(raw || '').trim();
+  if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+  return value.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+function initialUriFromMetadata(metadata) {
+  const line = String(metadata || '').split(/\r?\n/)
+    .find((entry) => entry.trim().startsWith('initial_uri='));
+  if (!line) return '';
+  return decodeMetadataValue(line.slice(line.indexOf('=') + 1));
+}
+
+function annotateValue(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+async function captureAndClearPendingQueue() {
+  const raw = await liquidsoapCommand('dj_queue.queue');
+  const rids = String(raw).trim().split(/\s+/).filter(Boolean);
+  const saved = [];
+  for (const rid of rids) {
+    try {
+      const metadata = await liquidsoapCommand(`request.metadata ${rid}`);
+      const uri = initialUriFromMetadata(metadata);
+      if (!uri) continue;
+      const removed = await liquidsoapCommand(`dj_queue_remove ${rid}`);
+      if (String(removed).trim() === 'OK') saved.push(uri);
+    } catch (error) {
+      await log(`Could not temporarily move queued request ${rid}: ${error.message}`);
+    }
+  }
+  return saved;
+}
+
+async function pushLiquidsoapRequest(uri) {
+  const result = await liquidsoapCommand(`dj_queue.push ${uri}`, 5000);
+  if (/ERROR|invalid|failed/i.test(String(result))) {
+    throw new Error(`Liquidsoap refused a queued item: ${result}`);
+  }
+  return result;
+}
+
+async function queueAsProgrammeItem(packagePath) {
+  const pending = await captureAndClearPendingQueue();
+  const bulletinUri = `annotate:title="${annotateValue('Hourly News Bulletin')}",artist="${annotateValue('SUB/WAVE News')}",liq_cross_duration="0.25":${packagePath}`;
+  let restored = 0;
+  try {
+    await pushLiquidsoapRequest(bulletinUri);
+    for (const uri of pending) {
+      await pushLiquidsoapRequest(uri);
+      restored += 1;
+    }
+  } catch (error) {
+    // Put back only requests that were not already restored, avoiding duplicate
+    // tracks when a later push fails after earlier ones succeeded.
+    for (const uri of pending.slice(restored)) {
+      try { await pushLiquidsoapRequest(uri); } catch {}
+    }
+    throw error;
+  }
+
+  // The local WAV resolves almost instantly, but give request.queue a moment to
+  // promote it before ending the current track. The bulletin then becomes the
+  // next main programme item; the following queued/automatic song starts only
+  // after its outro finishes.
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 900));
+  await controllerRequest('/dj/skip', { method: 'POST' });
+  return { movedPending: pending.length };
 }
 
 async function waitUntilMissing(path, timeoutMs = 90000) {
@@ -778,18 +1001,32 @@ async function runBulletin(reason = 'manual') {
   const config = await settings();
   try {
     await log(`Bulletin started (${reason}).`);
-    const { candidates, ledger } = await collectHeadlines(config);
-    if (!candidates.length) throw new Error('There are no fresh headlines to read.');
+    const { candidates, ledger, freshness } = await collectHeadlines(config);
 
     const snapshot = await subwaveSnapshot();
     const presenter = resolvePresenter(snapshot, config);
-    const generated = await generateBulletinText(snapshot, config, candidates, presenter);
-    const speech = await synthesizeVoice(snapshot, config, presenter, generated.text);
-    const bulletin = await makeBulletinAudio(config, speech.path);
+    const generated = await generateBulletinText(snapshot, config, candidates, presenter, freshness);
+    const speechPaths = [];
+    let resolvedSpeech = null;
+    for (const story of generated.stories) {
+      const speech = await synthesizeVoice(snapshot, config, presenter, story);
+      speechPaths.push(speech.path);
+      resolvedSpeech ||= speech;
+    }
+    const narration = await makeNarrationAudio(config, speechPaths);
+    const bulletin = await makeBulletinAudio(config, narration);
     const packagePath = await makeFullPackage(bulletin);
-    await queueAudio(packagePath);
+    let playback;
+    if (config.interruptCurrentTrack) {
+      playback = await queueAsProgrammeItem(packagePath);
+    } else {
+      await queueAudio(packagePath);
+      playback = { movedPending: 0 };
+    }
 
-    for (const item of candidates) ledger.add(item.key);
+    if (freshness === 'fresh') {
+      for (const item of candidates) ledger.add(item.key);
+    }
     await saveJson(SEEN_FILE, {
       keys: Array.from(ledger).slice(-500),
       updatedAt: new Date().toISOString(),
@@ -801,8 +1038,15 @@ async function runBulletin(reason = 'manual') {
       lastRunStatus: 'ok',
     };
     await saveJson(SETTINGS_FILE, latest);
-    await log(`Bulletin queued with presenter ${presenter?.name || 'unknown'} using ${generated.provider}/${generated.model}, ${speech.voice.engine}/${speech.voice.voice || 'default'}: ${generated.text}`);
-    return { ok: true, spoken: generated.text };
+    await log(`Bulletin queued (${freshness}; ${generated.stories.length} stories; ${config.storyPauseSeconds}s story gaps; ${config.interruptCurrentTrack ? 'programme-item handover' : 'foreground voice'}; moved ${playback.movedPending} pending tracks) with presenter ${presenter?.name || 'unknown'} using ${generated.provider}/${generated.model}, ${resolvedSpeech.voice.engine}/${resolvedSpeech.voice.voice || 'default'}: ${generated.text}`);
+    return {
+      ok: true,
+      spoken: generated.text,
+      freshness,
+      storyCount: generated.stories.length,
+      storyPauseSeconds: config.storyPauseSeconds,
+      interruptedTrack: config.interruptCurrentTrack,
+    };
   } catch (error) {
     const latest = {
       ...config,

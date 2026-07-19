@@ -19,6 +19,8 @@ services:
       MANAGER_PORT: "7711"
       MANAGER_IMAGE: "subwave-news-bulletin-manager:local"
       CONTROLLER_URL: "http://controller:7701"
+      LIQUIDSOAP_HOST: "broadcast"
+      LIQUIDSOAP_PORT: "1234"
       TZ: "${TZ:-Australia/Sydney}"
       GITHUB_REPO: "CasketPizza/SUBWAVE-news-bulletin"
     volumes:

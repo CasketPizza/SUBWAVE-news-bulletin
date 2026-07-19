@@ -26,17 +26,100 @@ compose() {
   COMPOSE_FILE= docker compose --env-file "$EXTENSION_DIR/.env" -f "$EXTENSION_DIR/docker-compose.yml" "$@"
 }
 
+container_networks() {
+  local container_id="$1"
+  docker inspect "$container_id" --format '{{range $name, $cfg := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}' \
+    | sed '/^[[:space:]]*$/d'
+}
+
+first_network() {
+  container_networks "$1" | head -n1
+}
+
+shared_network() {
+  local first_id="$1"
+  local second_id="$2"
+  local second_networks
+  second_networks="$(container_networks "$second_id")"
+  while IFS= read -r network; do
+    [[ -n "$network" ]] || continue
+    if printf '%s\n' "$second_networks" | grep -Fxq "$network"; then
+      printf '%s\n' "$network"
+      return 0
+    fi
+  done < <(container_networks "$first_id")
+  return 1
+}
+
 controller_id() {
   (cd "$SUBWAVE_DIR" && docker compose ps -q controller)
 }
 
-ensure_caddy_network() {
+broadcast_id() {
+  (cd "$SUBWAVE_DIR" && docker compose ps -q broadcast)
+}
+
+caddy_id() {
+  (cd "$SUBWAVE_DIR" && docker compose ps -q caddy)
+}
+
+set_env_key() {
+  local key="$1"
+  local value="$2"
+  local file="$EXTENSION_DIR/.env"
+  local tmp="${file}.tmp.$$"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done=0 }
+    index($0, key "=") == 1 { print key "=" value; done=1; next }
+    { print }
+    END { if (!done) print key "=" value }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+refresh_detected_networks() {
+  local cid bid edge_id audio_network caddy_network
+  cid="$(controller_id)"
+  bid="$(broadcast_id)"
+  edge_id="$(caddy_id)"
+  [[ -n "$cid" ]] || die "The SUB/WAVE controller container is not running."
+  [[ -n "$bid" ]] || die "The SUB/WAVE broadcast container is not running."
+  [[ -n "$edge_id" ]] || die "The SUB/WAVE Caddy container is not running."
+
+  audio_network="$(shared_network "$cid" "$bid" || true)"
+  caddy_network="$(first_network "$edge_id")"
+  [[ -n "$audio_network" ]] || die "Could not detect a network shared by SUB/WAVE's controller and broadcast services."
+  [[ -n "$caddy_network" ]] || die "Could not detect Caddy's Docker network."
+
+  SUBWAVE_AUDIO_NETWORK="$audio_network"
+  SUBWAVE_CONTROLLER_NETWORK="$audio_network"
+  SUBWAVE_NETWORK="$audio_network"
+  SUBWAVE_CADDY_NETWORK="$caddy_network"
+  export SUBWAVE_AUDIO_NETWORK SUBWAVE_CONTROLLER_NETWORK SUBWAVE_NETWORK SUBWAVE_CADDY_NETWORK
+
+  set_env_key SUBWAVE_AUDIO_NETWORK "$SUBWAVE_AUDIO_NETWORK"
+  set_env_key SUBWAVE_CONTROLLER_NETWORK "$SUBWAVE_CONTROLLER_NETWORK"
+  set_env_key SUBWAVE_NETWORK "$SUBWAVE_NETWORK"
+  set_env_key SUBWAVE_CADDY_NETWORK "$SUBWAVE_CADDY_NETWORK"
+}
+
+ensure_runtime_networks() {
   local id
   id="$(compose ps -q news-bulletin-manager)"
   [[ -n "$id" ]] || die "The News Bulletin Manager container is not running."
+  [[ -n "$SUBWAVE_AUDIO_NETWORK" ]] || die "SUBWAVE_AUDIO_NETWORK is missing from $EXTENSION_DIR/.env"
   [[ -n "$SUBWAVE_CADDY_NETWORK" ]] || die "SUBWAVE_CADDY_NETWORK is missing from $EXTENSION_DIR/.env"
 
-  if [[ "$SUBWAVE_CADDY_NETWORK" != "$SUBWAVE_CONTROLLER_NETWORK" ]]; then
+  # Compose normally creates the manager on the audio network. Keep this explicit
+  # for upgrades from older releases whose .env pointed at a controller-only
+  # network. The alias is harmless when the network is already attached.
+  docker network connect --alias subwave-news-bulletin "$SUBWAVE_AUDIO_NETWORK" "$id" 2>/dev/null || {
+    docker inspect "$id" --format '{{json .NetworkSettings.Networks}}' \
+      | grep -Fq "\"$SUBWAVE_AUDIO_NETWORK\"" \
+      || die "Could not attach the manager to SUB/WAVE's controller/broadcast network: $SUBWAVE_AUDIO_NETWORK"
+  }
+
+  if [[ "$SUBWAVE_CADDY_NETWORK" != "$SUBWAVE_AUDIO_NETWORK" ]]; then
     docker network connect --alias subwave-news-bulletin "$SUBWAVE_CADDY_NETWORK" "$id" 2>/dev/null || {
       docker inspect "$id" --format '{{json .NetworkSettings.Networks}}' \
         | grep -Fq "\"$SUBWAVE_CADDY_NETWORK\"" \
@@ -90,9 +173,10 @@ update_worker() {
   git -C "$EXTENSION_DIR" fetch --prune origin main
   git -C "$EXTENSION_DIR" reset --hard origin/main
   install_skill_files
+  refresh_detected_networks
   compose build news-bulletin-manager
   compose up -d --force-recreate news-bulletin-manager
-  ensure_caddy_network
+  ensure_runtime_networks
   install_proxy
   sleep 3
   rescan_skill
@@ -107,9 +191,10 @@ rollback_worker() {
   git -C "$EXTENSION_DIR" reset --hard "$target"
   printf '%s\n' "$current" > "$DATA_DIR/previous-version"
   install_skill_files
+  refresh_detected_networks
   compose build news-bulletin-manager
   compose up -d --force-recreate news-bulletin-manager
-  ensure_caddy_network
+  ensure_runtime_networks
   install_proxy
   sleep 3
   rescan_skill
@@ -137,12 +222,14 @@ case "${1:-status}" in
     rollback_worker
     ;;
   restart)
+    refresh_detected_networks
     compose up -d --force-recreate news-bulletin-manager
-    ensure_caddy_network
+    ensure_runtime_networks
     refresh_proxy
     ;;
   ensure-network)
-    ensure_caddy_network
+    refresh_detected_networks
+    ensure_runtime_networks
     ;;
   refresh-proxy)
     say "Refreshing the /news-bulletin/ route from the current SUB/WAVE Caddy image"

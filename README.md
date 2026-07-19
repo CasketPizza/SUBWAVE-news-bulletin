@@ -16,8 +16,11 @@ replacing any SUB/WAVE application files.
   source-material handling, and on-air delivery
 - Uploads an intro jingle, a background news bed, and an outro jingle
 - Mixes the voice over the background bed with adjustable level and fades
-- Queues one complete foreground package through SUB/WAVE's existing `say.txt`
-  handoff
+- Inserts a configurable, real silence gap between separately rendered stories
+- Still produces a recap when every live headline has already aired; if feeds are
+  temporarily unavailable, it can use the last successful headline cache
+- Ends the current song, inserts the complete bulletin as the next main programme
+  item, preserves pending song order, and starts the following song after the outro
 - Provides a web UI for settings, uploads, run-now testing, updates, and rollback
 
 ## Newsroom controls
@@ -51,11 +54,11 @@ entered manually for compatible engines.
 
 ```text
 SUB/WAVE normal hourly announcement at :00
-→ complete news package queues at :01
+→ at :01, the current song is ended using SUB/WAVE's normal skip transition
 → intro jingle
-→ headlines over the uploaded background bed
+→ clearly separated headlines over the uploaded background bed
 → outro jingle
-→ normal station audio continues
+→ the next queued or automatic song starts
 ```
 
 The schedule may instead be set to:
@@ -66,6 +69,36 @@ The schedule may instead be set to:
 
 There is no “replace the native hourly announcement” option because doing that
 would require changing SUB/WAVE itself.
+
+
+## Headline freshness and recap behaviour
+
+A scheduled bulletin is not cancelled merely because all current feed items have
+already appeared in an earlier bulletin. The manager uses this order:
+
+1. Unseen items from the live feeds.
+2. A measured recap of the current live feed items when there are no unseen items.
+3. The most recently cached feed items when every configured feed is temporarily
+   unavailable.
+
+Recap and cached runs explicitly tell the LLM not to describe the stories as
+breaking or newly arrived. A first-ever run still needs at least one successful
+feed fetch because there is no cache yet.
+
+## Story separation and programme handover
+
+Each story is synthesized as its own speech clip. The manager joins those clips
+with a configurable silence gap, defaulting to 2.25 seconds, so unrelated reports
+do not run together. When a model ignores the requested story markers, the
+manager retries the script once with a stricter format instruction.
+
+In the default programme-item mode, the manager temporarily moves pending
+Liquidsoap queue entries, inserts the complete intro/news/outro WAV first, restores
+the pending entries in their original order, then calls SUB/WAVE's admin-only
+track-skip endpoint. The current song therefore hands over to the bulletin and the
+next queued or automatic song follows the bulletin. A short silent tail ensures
+the next track does not overlap the final spoken word or audible end of the outro.
+The incoming handover itself follows SUB/WAVE's normal skip/crossfade behaviour.
 
 ## What it changes
 
@@ -107,8 +140,9 @@ chmod +x install.sh manage.sh
 ./install.sh
 ```
 
-The installer discovers the actual SUB/WAVE state bind mount and the controller
-and Caddy Docker networks from the running containers.
+The installer discovers the actual SUB/WAVE state bind mount, the Docker network
+shared by the controller and broadcast services, and Caddy's edge network from
+the running containers.
 
 For a non-default SUB/WAVE directory:
 
@@ -135,8 +169,10 @@ page.
 4. Edit the three newsroom instruction fields.
 5. Add or remove RSS/Atom sources.
 6. Upload the intro jingle, background music, and outro jingle.
-7. Start with the bed around `-18 dB`.
-8. Save and press **Run bulletin now**.
+7. Set the story gap; `2.25 seconds` is the default for an obvious story change.
+8. Keep **End the current song and air the bulletin as a standalone programme item** enabled.
+9. Start with the bed around `-18 dB`.
+10. Save and press **Run bulletin now**.
 
 Uploads are converted to stereo 44.1 kHz WAV with FFmpeg. WAV, MP3, FLAC, OGG,
 M4A, and other FFmpeg-readable audio formats are accepted.

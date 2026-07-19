@@ -12,7 +12,7 @@
       <div>
         <p class="eyebrow">STANDALONE SUB/WAVE COMPANION</p>
         <h1>Hourly News Bulletin</h1>
-        <p class="lede">Intro jingle, headlines over a music bed, then an outro—using SUB/WAVE’s LLM with a configurable news presenter, voice and newsroom brief.</p>
+        <p class="lede">A scheduled radio news programme with an intro, clearly separated stories over a bed, and an outro—using SUB/WAVE’s LLM with a configurable presenter and voice.</p>
         <p class="safe-note">This companion does not patch or replace any SUB/WAVE application files. It is mounted at /news-bulletin/ through a reversible Caddy overlay.</p>
       </div>
       <button id="runNow" class="primary">Run bulletin now</button>
@@ -56,7 +56,7 @@
           <input id="timeZone" type="text" placeholder="Australia/Sydney">
         </label>
       </div>
-      <p class="hint">A portable companion cannot receive an “hourly announcement finished” event from SUB/WAVE, so the default uses :01. Liquidsoap’s foreground queue keeps the bulletin behind anything already queued.</p>
+      <p class="hint">A portable companion cannot receive an “hourly announcement finished” event from SUB/WAVE, so the default uses :01. In programme-item mode, the current song is ended and the bulletin is placed ahead of pending songs.</p>
     </section>
 
     <section>
@@ -147,13 +147,21 @@
           <input id="maxHeadlines" type="number" min="1" max="10">
         </label>
       </div>
-      <label>Maximum spoken length
-        <div class="suffix compact"><input id="maxLengthSeconds" type="number" min="20" max="180"><span>seconds</span></div>
-      </label>
+      <div class="grid two">
+        <label>Maximum spoken length
+          <div class="suffix compact"><input id="maxLengthSeconds" type="number" min="20" max="180"><span>seconds</span></div>
+        </label>
+        <label>Clear pause between stories
+          <div class="suffix compact"><input id="storyPauseSeconds" type="number" min="0.5" max="6" step="0.25"><span>seconds</span></div>
+          <small class="field-help">Real silence is inserted between separately rendered stories, making each headline unmistakably distinct.</small>
+        </label>
+      </div>
     </section>
 
     <section>
       <h2>Audio package</h2>
+      <label class="toggle programme-toggle"><input id="interruptCurrentTrack" type="checkbox"> End the current song and air the bulletin as a standalone programme item</label>
+      <p class="hint">When enabled, SUB/WAVE skips the current song, moves any pending songs behind the complete intro/news/outro package, and starts the next queued or automatic song only after the package finishes. The handover into the intro uses SUB/WAVE’s normal skip transition. Disable this only to use ordinary foreground-voice ducking instead.</p>
       <div class="audio-grid">
         <article class="audio-card">
           <h3>Intro jingle</h3>

@@ -8,11 +8,29 @@ TZ="${TZ:-Australia/Sydney}"
 say() { printf '\n\033[1;35m%s\033[0m\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-first_network() {
+container_networks() {
   local container_id="$1"
   docker inspect "$container_id" --format '{{range $name, $cfg := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}' \
-    | sed '/^[[:space:]]*$/d' \
-    | head -n1
+    | sed '/^[[:space:]]*$/d'
+}
+
+first_network() {
+  container_networks "$1" | head -n1
+}
+
+shared_network() {
+  local first_id="$1"
+  local second_id="$2"
+  local second_networks
+  second_networks="$(container_networks "$second_id")"
+  while IFS= read -r network; do
+    [[ -n "$network" ]] || continue
+    if printf '%s\n' "$second_networks" | grep -Fxq "$network"; then
+      printf '%s\n' "$network"
+      return 0
+    fi
+  done < <(container_networks "$first_id")
+  return 1
 }
 
 connect_manager_to_caddy_network() {
@@ -44,19 +62,22 @@ command -v python3 >/dev/null || die "Python 3 is not installed."
 
 cd "$SUBWAVE_DIR"
 CONTROLLER_ID="$(docker compose ps -q controller)"
+BROADCAST_ID="$(docker compose ps -q broadcast)"
 CADDY_ID="$(docker compose ps -q caddy)"
 [[ -n "$CONTROLLER_ID" ]] || die "The SUB/WAVE controller container is not running."
+[[ -n "$BROADCAST_ID" ]] || die "The SUB/WAVE broadcast container is not running."
 [[ -n "$CADDY_ID" ]] || die "The SUB/WAVE Caddy container is not running."
 
-# The companion needs to reach the controller, while Caddy needs to reach the
-# companion. Most SUB/WAVE installs use one shared network, but custom Compose
-# overlays can put those services on different networks. Attach the manager to
-# both instead of assuming a shared network exists.
-SUBWAVE_CONTROLLER_NETWORK="$(first_network "$CONTROLLER_ID")"
+# The manager now talks to both controller:7701 and broadcast:1234. Select the
+# network those two services actually share rather than blindly using the first
+# network listed on the controller. Caddy may be isolated on a second edge
+# network, which is attached after Compose starts the manager.
+SUBWAVE_AUDIO_NETWORK="$(shared_network "$CONTROLLER_ID" "$BROADCAST_ID" || true)"
 SUBWAVE_CADDY_NETWORK="$(first_network "$CADDY_ID")"
-[[ -n "$SUBWAVE_CONTROLLER_NETWORK" ]] || die "Could not detect the controller's Docker network."
+[[ -n "$SUBWAVE_AUDIO_NETWORK" ]] || die "Could not detect a Docker network shared by SUB/WAVE's controller and broadcast services."
 [[ -n "$SUBWAVE_CADDY_NETWORK" ]] || die "Could not detect Caddy's Docker network."
-SUBWAVE_NETWORK="$SUBWAVE_CONTROLLER_NETWORK"
+SUBWAVE_CONTROLLER_NETWORK="$SUBWAVE_AUDIO_NETWORK"
+SUBWAVE_NETWORK="$SUBWAVE_AUDIO_NETWORK"
 
 # Use the running container's actual bind mount. This works with ./state,
 # absolute paths, and custom STATE_DIR values without confusing the in-container
@@ -71,6 +92,7 @@ SUBWAVE_DIR=$SUBWAVE_DIR
 SUBWAVE_STATE_DIR=$SUBWAVE_STATE_DIR
 SUBWAVE_NETWORK=$SUBWAVE_NETWORK
 SUBWAVE_CONTROLLER_NETWORK=$SUBWAVE_CONTROLLER_NETWORK
+SUBWAVE_AUDIO_NETWORK=$SUBWAVE_AUDIO_NETWORK
 SUBWAVE_CADDY_NETWORK=$SUBWAVE_CADDY_NETWORK
 TZ=$TZ
 ENVEOF

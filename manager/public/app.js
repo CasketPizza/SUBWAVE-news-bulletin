@@ -150,7 +150,7 @@ async function load() {
   model.feeds.forEach(feedRow);
   [
     'enabled', 'customMinute', 'timeZone', 'maxItemsPerFeed', 'maxCandidates',
-    'maxHeadlines', 'maxLengthSeconds', 'storySelectionInstructions',
+    'maxHeadlines', 'maxLengthSeconds', 'storyPauseSeconds', 'interruptCurrentTrack', 'storySelectionInstructions',
     'articleHandlingInstructions', 'deliveryInstructions', 'voiceMode',
     'voiceName', 'voiceSpeed', 'voiceLanguage', 'bedVolumeDb', 'bedFadeIn',
     'bedFadeOut', 'loopBed',
@@ -185,6 +185,8 @@ function collect() {
     maxCandidates: Number($('maxCandidates').value),
     maxHeadlines: Number($('maxHeadlines').value),
     maxLengthSeconds: Number($('maxLengthSeconds').value),
+    storyPauseSeconds: Number($('storyPauseSeconds').value),
+    interruptCurrentTrack: $('interruptCurrentTrack').checked,
     storySelectionInstructions: $('storySelectionInstructions').value,
     articleHandlingInstructions: $('articleHandlingInstructions').value,
     deliveryInstructions: $('deliveryInstructions').value,
@@ -289,7 +291,9 @@ $('runNow').onclick = async () => {
   notice('Preparing the bulletin. This can take a minute.');
   try {
     const result = await api('/api/run', { method: 'POST' });
-    notice(`Bulletin queued: ${result.spoken}`);
+    const freshness = result.freshness === 'fresh' ? 'new headlines'
+      : result.freshness === 'cached' ? 'cached recap' : 'current-headlines recap';
+    notice(`Bulletin queued (${freshness}, ${result.storyCount || 1} stories): ${result.spoken}`);
     await load();
   } catch (error) {
     notice(error.message, true);
