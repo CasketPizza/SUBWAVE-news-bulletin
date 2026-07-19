@@ -165,7 +165,14 @@ remove_proxy() {
   bash "$EXTENSION_DIR/proxy/remove_proxy.sh"
 }
 
+restore_checkout_owner() {
+  [[ "${HOST_REPO_UID:-}" =~ ^[0-9]+$ ]] || return 0
+  [[ "${HOST_REPO_GID:-}" =~ ^[0-9]+$ ]] || return 0
+  chown -R "$HOST_REPO_UID:$HOST_REPO_GID" "$EXTENSION_DIR" 2>/dev/null || true
+}
+
 update_worker() {
+  trap restore_checkout_owner EXIT
   mkdir -p "$DATA_DIR"
   git config --global --add safe.directory "$EXTENSION_DIR" >/dev/null 2>&1 || true
   current="$(git -C "$EXTENSION_DIR" rev-parse HEAD)"
@@ -183,6 +190,7 @@ update_worker() {
 }
 
 rollback_worker() {
+  trap restore_checkout_owner EXIT
   [[ -f "$DATA_DIR/previous-version" ]] || die "No previous version is recorded."
   target="$(tr -d '\r\n' < "$DATA_DIR/previous-version")"
   [[ -n "$target" ]] || die "The previous-version file is empty."

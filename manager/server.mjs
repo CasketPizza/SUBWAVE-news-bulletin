@@ -955,15 +955,68 @@ async function pushLiquidsoapRequest(uri) {
   if (/ERROR|invalid|failed/i.test(String(result))) {
     throw new Error(`Liquidsoap refused a queued item: ${result}`);
   }
-  return result;
+  const rid = String(result).match(/\b\d+\b/)?.[0] || '';
+  if (!rid) throw new Error(`Liquidsoap queued the item but returned no request id: ${result}`);
+  return rid;
+}
+
+function requestStatusFromMetadata(metadata) {
+  const match = /^status=([^\r\n]+)/mi.exec(String(metadata || ''));
+  return match ? match[1].trim().toLowerCase() : '';
+}
+
+async function liquidsoapRequestStatus(rid) {
+  try {
+    const metadata = await liquidsoapCommand(`request.metadata ${rid}`, 3000);
+    return { status: requestStatusFromMetadata(metadata), metadata };
+  } catch (error) {
+    return { status: '', metadata: '', error };
+  }
+}
+
+async function requestTrace(rid) {
+  try { return await liquidsoapCommand(`request.trace ${rid}`, 3000); } catch { return ''; }
+}
+
+async function waitForRequestState(rid, accepted, timeoutMs) {
+  const wanted = new Set(accepted);
+  const deadline = Date.now() + timeoutMs;
+  let last = { status: '', metadata: '' };
+  while (Date.now() < deadline) {
+    last = await liquidsoapRequestStatus(rid);
+    if (wanted.has(last.status)) return last;
+    if (last.status === 'destroyed') break;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+  }
+  return last;
+}
+
+async function startProgrammeRequest(rid) {
+  // cross() may already have prepared an automatic song before this bulletin was
+  // inserted. One skip can therefore land on that prefetched song even though the
+  // bulletin is first in dj_queue. Confirm the bulletin RID actually reaches the
+  // playing state and, only when it has not, discard the prefetched hop as well.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await controllerRequest('/dj/skip', { method: 'POST' });
+    const state = await waitForRequestState(rid, ['playing', 'destroyed'], 3500);
+    if (state.status === 'playing') return attempt;
+    if (state.status === 'destroyed') {
+      const trace = await requestTrace(rid);
+      throw new Error(`The bulletin request was destroyed before playback.${trace ? ` ${trace.slice(-500)}` : ''}`);
+    }
+    await log(`Bulletin RID ${rid} was still ${state.status || 'pending'} after skip ${attempt}; clearing a prefetched music track.`);
+  }
+  const trace = await requestTrace(rid);
+  throw new Error(`The bulletin was queued but never reached the air after three handover attempts.${trace ? ` ${trace.slice(-500)}` : ''}`);
 }
 
 async function queueAsProgrammeItem(packagePath) {
   const pending = await captureAndClearPendingQueue();
   const bulletinUri = `annotate:title="${annotateValue('Hourly News Bulletin')}",artist="${annotateValue('SUB/WAVE News')}",liq_cross_duration="0.25":${packagePath}`;
   let restored = 0;
+  let bulletinRid = '';
   try {
-    await pushLiquidsoapRequest(bulletinUri);
+    bulletinRid = await pushLiquidsoapRequest(bulletinUri);
     for (const uri of pending) {
       await pushLiquidsoapRequest(uri);
       restored += 1;
@@ -977,13 +1030,19 @@ async function queueAsProgrammeItem(packagePath) {
     throw error;
   }
 
-  // The local WAV resolves almost instantly, but give request.queue a moment to
-  // promote it before ending the current track. The bulletin then becomes the
-  // next main programme item; the following queued/automatic song starts only
-  // after its outro finishes.
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 900));
-  await controllerRequest('/dj/skip', { method: 'POST' });
-  return { movedPending: pending.length };
+  await log(`Bulletin audio queued in Liquidsoap as RID ${bulletinRid}; waiting for it to prepare.`);
+  const prepared = await waitForRequestState(bulletinRid, ['ready', 'playing', 'destroyed'], 12000);
+  if (prepared.status === 'destroyed') {
+    const trace = await requestTrace(bulletinRid);
+    throw new Error(`The bulletin request failed while preparing.${trace ? ` ${trace.slice(-500)}` : ''}`);
+  }
+  if (!['ready', 'playing'].includes(prepared.status)) {
+    await log(`Bulletin RID ${bulletinRid} remained ${prepared.status || 'pending'}; beginning the handover so Liquidsoap resolves it on demand.`);
+  }
+
+  const skipCount = prepared.status === 'playing' ? 0 : await startProgrammeRequest(bulletinRid);
+  await log(`Bulletin RID ${bulletinRid} confirmed on air after ${skipCount} skip command${skipCount === 1 ? '' : 's'}.`);
+  return { movedPending: pending.length, bulletinRid, skipCount };
 }
 
 async function waitUntilMissing(path, timeoutMs = 90000) {
@@ -1155,29 +1214,58 @@ function git(args) {
   return run('git', ['-C', EXTENSION_DIR, ...args]);
 }
 
-async function versionStatus() {
+const VERSION_CHECK_TTL_MS = 5 * 60 * 1000;
+let remoteVersionCache = null;
+
+function remoteMainCommit() {
+  const result = spawnSync(
+    'git',
+    ['-C', EXTENSION_DIR, 'ls-remote', '--heads', 'origin', 'refs/heads/main'],
+    { encoding: 'utf8', timeout: 15000 },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error((result.stderr || result.stdout || 'git ls-remote failed').trim());
+  }
+  const sha = String(result.stdout || '').trim().split(/\s+/)[0] || '';
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('The remote main branch returned no commit id.');
+  return sha;
+}
+
+async function versionStatus(force = false) {
   let installedCommit = null;
   let latestCommit = null;
   let version = 'unknown';
+  let updateCheckError = null;
   try { installedCommit = git(['rev-parse', 'HEAD']); } catch {}
   try { version = (await readFile(join(EXTENSION_DIR, 'VERSION'), 'utf8')).trim(); } catch {}
-  try {
-    const response = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/commits/main`, {
-      headers: { 'User-Agent': 'SUBWAVE-News-Bulletin' },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (response.ok) latestCommit = (await response.json()).sha;
-  } catch {}
+
+  const now = Date.now();
+  if (!force && remoteVersionCache && now - remoteVersionCache.checkedAt < VERSION_CHECK_TTL_MS) {
+    ({ latestCommit, updateCheckError } = remoteVersionCache);
+  } else {
+    try {
+      latestCommit = remoteMainCommit();
+    } catch (error) {
+      updateCheckError = error.message;
+    }
+    remoteVersionCache = { latestCommit, updateCheckError, checkedAt: now };
+  }
+
   return {
     version,
     installedCommit,
     latestCommit,
     updateAvailable: Boolean(installedCommit && latestCommit && installedCommit !== latestCommit),
+    updateCheckError,
+    updateCheckedAt: remoteVersionCache ? new Date(remoteVersionCache.checkedAt).toISOString() : null,
   };
 }
 
 function updaterContainer(command) {
   const name = `subwave-news-${command}-${Date.now()}`;
+  let checkoutOwner = { uid: 0, gid: 0 };
+  try { checkoutOwner = fs.statSync(EXTENSION_DIR); } catch {}
   const args = [
     'run', '-d', '--rm', '--name', name,
     '-v', '/var/run/docker.sock:/var/run/docker.sock',
@@ -1191,6 +1279,8 @@ function updaterContainer(command) {
     '-e', 'DATA_DIR=/var/sub-wave/extensions/hourly-news',
     '-e', `SUBWAVE_NETWORK=${SUBWAVE_NETWORK}`,
     '-e', `MANAGER_PORT=${MANAGER_PORT}`,
+    '-e', `HOST_REPO_UID=${checkoutOwner.uid}`,
+    '-e', `HOST_REPO_GID=${checkoutOwner.gid}`,
     MANAGER_IMAGE,
     'bash', './manage.sh', command,
   ];
@@ -1321,7 +1411,7 @@ app.post('/api/run', async (_req, res) => {
   }
 });
 
-app.get('/api/status', async (_req, res) => {
+app.get('/api/status', async (req, res) => {
   const config = await settings();
   let subwave = {
     connected: false,
@@ -1353,7 +1443,7 @@ app.get('/api/status', async (_req, res) => {
     lastRunAt: config.lastRunAt,
     lastRunStatus: config.lastRunStatus,
     subwave,
-    ...(await versionStatus()),
+    ...(await versionStatus(req.query.refresh === '1')),
   });
 });
 

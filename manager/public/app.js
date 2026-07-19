@@ -250,12 +250,14 @@ function previewAsset(type) {
   player.play();
 }
 
-async function loadStatus() {
-  const status = await api('/api/status');
+async function loadStatus(forceUpdateCheck = false) {
+  const status = await api(`/api/status${forceUpdateCheck ? '?refresh=1' : ''}`);
   $('managerStatus').textContent = status.busy ? 'Preparing bulletin…' : 'Running';
   $('versionStatus').textContent = status.updateAvailable
     ? `${status.version} — update available`
-    : status.version;
+    : status.updateCheckError
+      ? `${status.version} — update check unavailable`
+      : status.version;
   $('subwaveStatus').textContent = status.subwave?.connected ? 'Connected' : `Error: ${status.subwave?.error || 'unreachable'}`;
   $('personaStatus').textContent = status.subwave?.persona || 'Unknown';
   $('llmStatus').textContent = status.subwave?.llm || 'Unknown';
@@ -313,8 +315,12 @@ document.querySelectorAll('[data-preview]').forEach((button) => {
 });
 
 $('checkUpdate').onclick = async () => {
-  const status = await loadStatus();
-  notice(status.updateAvailable ? 'An update is available.' : 'You are up to date.');
+  const status = await loadStatus(true);
+  if (status.updateCheckError) {
+    notice(`Could not check for updates: ${status.updateCheckError}`, true);
+  } else {
+    notice(status.updateAvailable ? 'An update is available.' : 'You are up to date.');
+  }
 };
 $('updateNow').onclick = () => command('/api/update', 'Update started.').catch((error) => notice(error.message, true));
 $('rollback').onclick = () => command('/api/rollback', 'Rollback started.').catch((error) => notice(error.message, true));

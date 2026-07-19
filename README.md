@@ -94,11 +94,15 @@ manager retries the script once with a stricter format instruction.
 
 In the default programme-item mode, the manager temporarily moves pending
 Liquidsoap queue entries, inserts the complete intro/news/outro WAV first, restores
-the pending entries in their original order, then calls SUB/WAVE's admin-only
-track-skip endpoint. The current song therefore hands over to the bulletin and the
-next queued or automatic song follows the bulletin. A short silent tail ensures
-the next track does not overlap the final spoken word or audible end of the outro.
-The incoming handover itself follows SUB/WAVE's normal skip/crossfade behaviour.
+the pending entries in their original order, and waits for Liquidsoap to prepare
+the bulletin request before calling SUB/WAVE's admin-only track-skip endpoint.
+It then confirms the bulletin request itself reached the playing state. When
+Liquidsoap had already prefetched an automatic song, the manager clears that
+single prefetched hop rather than silently claiming the bulletin aired. The current
+song therefore hands over to the bulletin and the next queued or automatic song
+follows it. A short silent tail ensures the next track does not overlap the final
+spoken word or audible end of the outro. The incoming handover itself follows
+SUB/WAVE's normal skip/crossfade behaviour.
 
 ## What it changes
 
@@ -214,7 +218,11 @@ Check for updates → Update now
 
 The updater changes only this companion repository and container. It preserves
 feeds, schedule settings, newsroom instructions, presenter/voice selection,
-seen-headline history, and uploaded audio under SUB/WAVE's persistent state.
+seen-headline history, and uploaded audio under SUB/WAVE's persistent state. The
+update check uses the repository's configured `origin` and caches background
+checks for five minutes; pressing **Check for updates** forces a fresh comparison.
+Updater and rollback workers also restore the checkout's original owner after a
+root-run Docker build, so later manual commands remain writable by the VM user.
 
 Use **Roll back** to return to the previously installed companion commit.
 
