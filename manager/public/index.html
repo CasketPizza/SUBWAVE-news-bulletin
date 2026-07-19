@@ -10,9 +10,10 @@
   <main>
     <header>
       <div>
-        <p class="eyebrow">SUB/WAVE EXTENSION</p>
+        <p class="eyebrow">STANDALONE SUB/WAVE COMPANION</p>
         <h1>Hourly News Bulletin</h1>
-        <p class="lede">Intro jingle, headlines over a music bed, then an outro—using SUB/WAVE’s active DJ voice and persona.</p>
+        <p class="lede">Intro jingle, headlines over a music bed, then an outro—using the active SUB/WAVE persona, LLM and voice.</p>
+        <p class="safe-note">This companion does not patch or replace any SUB/WAVE application files.</p>
       </div>
       <button id="runNow" class="primary">Run bulletin now</button>
     </header>
@@ -24,13 +25,15 @@
       <div class="status-grid">
         <div><span>Manager</span><strong id="managerStatus">Loading…</strong></div>
         <div><span>Extension</span><strong id="versionStatus">Loading…</strong></div>
-        <div><span>SUB/WAVE hook</span><strong id="patchStatus">Loading…</strong></div>
-        <div><span>Last bulletin</span><strong id="lastRun">Never</strong></div>
+        <div><span>SUB/WAVE</span><strong id="subwaveStatus">Loading…</strong></div>
+        <div><span>On-air persona</span><strong id="personaStatus">Loading…</strong></div>
+        <div><span>LLM</span><strong id="llmStatus">Loading…</strong></div>
+        <div><span>Voice</span><strong id="ttsStatus">Loading…</strong></div>
+        <div class="wide"><span>Last bulletin</span><strong id="lastRun">Never</strong></div>
       </div>
       <div class="actions">
         <button id="checkUpdate">Check for updates</button>
         <button id="updateNow">Update now</button>
-        <button id="reapply">Reapply after SUB/WAVE update</button>
         <button id="rollback">Roll back</button>
       </div>
     </section>
@@ -39,9 +42,8 @@
       <h2>Schedule</h2>
       <label class="toggle"><input id="enabled" type="checkbox"> Enable automatic bulletins</label>
       <div class="radio-list">
-        <label><input type="radio" name="scheduleMode" value="after"> After SUB/WAVE’s hourly announcement <small>(default; queues near the top of the hour after a short delay)</small></label>
-        <label><input type="radio" name="scheduleMode" value="before"> Before the hourly announcement <small>(at :59)</small></label>
-        <label><input type="radio" name="scheduleMode" value="replace"> Replace the normal hourly announcement</label>
+        <label><input type="radio" name="scheduleMode" value="after"> After SUB/WAVE’s hourly announcement <small>(default; queues at :01)</small></label>
+        <label><input type="radio" name="scheduleMode" value="before"> Before the hourly announcement <small>(queues at :59)</small></label>
         <label><input type="radio" name="scheduleMode" value="custom"> At a custom minute each hour</label>
         <label><input type="radio" name="scheduleMode" value="manual"> Manual only</label>
       </div>
@@ -49,13 +51,11 @@
         <label>Custom minute
           <input id="customMinute" type="number" min="0" max="59">
         </label>
-        <label>After-mode delay
-          <div class="suffix"><input id="afterDelaySeconds" type="number" min="5" max="55"><span>seconds</span></div>
-        </label>
         <label>Station timezone
           <input id="timeZone" type="text" placeholder="Australia/Sydney">
         </label>
       </div>
+      <p class="hint">A portable companion cannot receive an “hourly announcement finished” event from SUB/WAVE, so the default uses :01. Liquidsoap’s foreground queue keeps the bulletin behind anything already queued.</p>
     </section>
 
     <section>

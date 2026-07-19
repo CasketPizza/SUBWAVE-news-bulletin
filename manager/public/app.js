@@ -9,7 +9,7 @@ function notice(message, error = false) {
   box.classList.remove('hidden', 'error');
   if (error) box.classList.add('error');
   clearTimeout(noticeTimer);
-  noticeTimer = setTimeout(() => box.classList.add('hidden'), 8000);
+  noticeTimer = setTimeout(() => box.classList.add('hidden'), 10000);
 }
 
 async function api(path, options = {}) {
@@ -50,11 +50,11 @@ async function load() {
   $('feeds').innerHTML = '';
   model.feeds.forEach(feedRow);
   [
-    'enabled','customMinute','afterDelaySeconds','timeZone','maxItemsPerFeed',
-    'maxCandidates','maxHeadlines','maxLengthSeconds','bedVolumeDb',
-    'bedFadeIn','bedFadeOut','loopBed',
+    'enabled','customMinute','timeZone','maxItemsPerFeed','maxCandidates',
+    'maxHeadlines','maxLengthSeconds','bedVolumeDb','bedFadeIn','bedFadeOut','loopBed',
   ].forEach((id) => setValue(id, model[id]));
-  document.querySelector(`input[name=scheduleMode][value="${model.scheduleMode}"]`).checked = true;
+  const selected = document.querySelector(`input[name=scheduleMode][value="${model.scheduleMode}"]`);
+  if (selected) selected.checked = true;
   updateAssetStates();
   await Promise.all([loadStatus(), loadLogs()]);
 }
@@ -65,7 +65,6 @@ function collect() {
     enabled: $('enabled').checked,
     scheduleMode: document.querySelector('input[name=scheduleMode]:checked')?.value || 'after',
     customMinute: Number($('customMinute').value),
-    afterDelaySeconds: Number($('afterDelaySeconds').value),
     timeZone: $('timeZone').value,
     feeds: [...document.querySelectorAll('.feed-row')].map((row) => ({
       name: row.querySelector('.feed-name').value,
@@ -129,10 +128,13 @@ function previewAsset(type) {
 async function loadStatus() {
   const status = await api('/api/status');
   $('managerStatus').textContent = status.busy ? 'Preparing bulletin…' : 'Running';
-  $('patchStatus').textContent = status.patchInstalled ? 'Installed' : 'Needs reapply';
   $('versionStatus').textContent = status.updateAvailable
     ? `${status.version} — update available`
     : status.version;
+  $('subwaveStatus').textContent = status.subwave?.connected ? 'Connected' : `Error: ${status.subwave?.error || 'unreachable'}`;
+  $('personaStatus').textContent = status.subwave?.persona || 'Unknown';
+  $('llmStatus').textContent = status.subwave?.llm || 'Unknown';
+  $('ttsStatus').textContent = status.subwave?.tts || 'Unknown';
   $('lastRun').textContent = status.lastRunAt
     ? `${new Date(status.lastRunAt).toLocaleString()} — ${status.lastRunStatus}`
     : 'Never';
@@ -179,7 +181,6 @@ $('checkUpdate').onclick = async () => {
   notice(status.updateAvailable ? 'An update is available.' : 'You are up to date.');
 };
 $('updateNow').onclick = () => command('/api/update', 'Update started.').catch((error) => notice(error.message, true));
-$('reapply').onclick = () => command('/api/reapply', 'Reapply started.').catch((error) => notice(error.message, true));
 $('rollback').onclick = () => command('/api/rollback', 'Rollback started.').catch((error) => notice(error.message, true));
 $('refreshLogs').onclick = () => loadLogs().catch((error) => notice(error.message, true));
 

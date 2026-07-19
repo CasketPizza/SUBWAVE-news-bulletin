@@ -1,9 +1,8 @@
-// Native SUB/WAVE fallback tool for the Hourly News Bulletin.
-//
-// The companion manager uses the same settings file but provides the complete
-// intro -> background bed + speech -> outro package. Running this skill directly
-// from SUB/WAVE still gives a normal spoken bulletin without the audio package.
+// Native SUB/WAVE fallback tool for the standalone Hourly News companion.
+// The manager supplies the full audio package. Running this skill directly from
+// SUB/WAVE produces a plain spoken bulletin using the same configured feeds.
 
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 const SETTINGS = '/var/sub-wave/extensions/hourly-news/settings.json';
@@ -35,7 +34,11 @@ function titleKey(value) {
     .trim();
 }
 
-export default async function hourlyNews(ctx, state, services) {
+function digest(value) {
+  return createHash('sha256').update(value).digest('hex').slice(0, 32);
+}
+
+export default async function hourlyNews(_ctx, _state, services) {
   const config = await settings();
   const feeds = (Array.isArray(config.feeds) ? config.feeds : [])
     .filter((feed) => feed?.url)
@@ -85,14 +88,12 @@ export default async function hourlyNews(ctx, state, services) {
   }
 
   const fresh = merged.filter((item) => {
-    const key = `hourly-news-bulletin:${services.hashHeadline(titleKey(item.title))}`;
+    const key = `hourly-news-bulletin:${digest(titleKey(item.title))}`;
     return !services.recall.seen(key);
   }).slice(0, Number(config.maxCandidates) || 12);
 
   for (const item of fresh) {
-    services.recall.remember(
-      `hourly-news-bulletin:${services.hashHeadline(titleKey(item.title))}`,
-    );
+    services.recall.remember(`hourly-news-bulletin:${digest(titleKey(item.title))}`);
   }
 
   return fresh.length

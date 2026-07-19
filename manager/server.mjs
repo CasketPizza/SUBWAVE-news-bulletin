@@ -3,16 +3,20 @@ import multer from 'multer';
 import { XMLParser } from 'fast-xml-parser';
 import { createHash } from 'node:crypto';
 import {
-  mkdir, readFile, writeFile, rename, rm, readdir,
+  mkdir, readFile, writeFile, rename, rm, readdir, copyFile,
 } from 'node:fs/promises';
 import fs, { existsSync } from 'node:fs';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { basename, join, resolve } from 'node:path';
 
 const PORT = Number(process.env.PORT || 7711);
 const EXTENSION_DIR = resolve(process.env.EXTENSION_DIR || '/opt/subwave-news-bulletin');
-const SUBWAVE_DIR = resolve(process.env.SUBWAVE_DIR || '/opt/subwave');
 const STATE_DIR = resolve(process.env.STATE_DIR || '/var/sub-wave');
+const HOST_STATE_DIR = process.env.HOST_STATE_DIR || STATE_DIR;
+const SUBWAVE_NETWORK = process.env.SUBWAVE_NETWORK || '';
+const MANAGER_PORT = String(process.env.MANAGER_PORT || PORT);
+const MANAGER_IMAGE = process.env.MANAGER_IMAGE || 'subwave-news-bulletin-manager:local';
+const CONTROLLER_URL = (process.env.CONTROLLER_URL || 'http://controller:7701').replace(/\/$/, '');
 const DATA_DIR = join(STATE_DIR, 'extensions/hourly-news');
 const ASSET_DIR = join(DATA_DIR, 'assets');
 const GENERATED_DIR = join(DATA_DIR, 'generated');
@@ -21,16 +25,15 @@ const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 const SEEN_FILE = join(DATA_DIR, 'seen.json');
 const LOG_FILE = join(DATA_DIR, 'manager.log');
 const SAY_FILE = join(STATE_DIR, 'say.txt');
-const SUPPRESS_FILE = join(DATA_DIR, 'suppress-hourly');
 const SKILL_FILE = join(STATE_DIR, 'skills/hourly-news-bulletin/SKILL.md');
+const RAW_SUBWAVE_SETTINGS = join(STATE_DIR, 'settings.json');
+const SUBWAVE_SECRETS = join(STATE_DIR, 'secrets.env');
 const GITHUB_REPO = process.env.GITHUB_REPO || 'CasketPizza/SUBWAVE-news-bulletin';
-const CONTROLLER_URL = process.env.CONTROLLER_URL || 'http://controller:7701';
 
 const DEFAULTS = {
   enabled: true,
   scheduleMode: 'after',
-  customMinute: 0,
-  afterDelaySeconds: 30,
+  customMinute: 15,
   timeZone: process.env.TZ || 'Australia/Sydney',
   feeds: [
     { name: 'Guardian Australia', url: 'https://www.theguardian.com/australia-news/rss' },
@@ -46,6 +49,7 @@ const DEFAULTS = {
   loopBed: true,
   lastRunAt: null,
   lastRunStatus: null,
+  lastScheduleSlot: null,
 };
 
 await Promise.all([
@@ -55,7 +59,7 @@ await Promise.all([
   mkdir(UPLOAD_DIR, { recursive: true }),
 ]);
 
-function readEnv(path) {
+function readEnvFile(path) {
   const out = {};
   try {
     const text = fs.readFileSync(path, 'utf8');
@@ -73,9 +77,9 @@ function readEnv(path) {
   return out;
 }
 
-const subwaveEnv = readEnv(join(SUBWAVE_DIR, '.env'));
-const ADMIN_USER = process.env.ADMIN_USER || subwaveEnv.ADMIN_USER || '';
-const ADMIN_PASS = process.env.ADMIN_PASS || subwaveEnv.ADMIN_PASS || '';
+const stateSecrets = readEnvFile(SUBWAVE_SECRETS);
+const ADMIN_USER = process.env.ADMIN_USER || '';
+const ADMIN_PASS = process.env.ADMIN_PASS || '';
 
 function authHeader() {
   return `Basic ${Buffer.from(`${ADMIN_USER}:${ADMIN_PASS}`).toString('base64')}`;
@@ -108,7 +112,7 @@ async function settings() {
 
 function cleanSettings(body) {
   const input = body && typeof body === 'object' ? body : {};
-  const mode = ['after', 'before', 'replace', 'custom', 'manual'].includes(input.scheduleMode)
+  const mode = ['after', 'before', 'custom', 'manual'].includes(input.scheduleMode)
     ? input.scheduleMode : 'after';
   const feeds = (Array.isArray(input.feeds) ? input.feeds : [])
     .map((feed) => ({
@@ -130,7 +134,6 @@ function cleanSettings(body) {
     enabled: input.enabled !== false,
     scheduleMode: mode,
     customMinute: Math.min(59, Math.max(0, Number(input.customMinute) || 0)),
-    afterDelaySeconds: Math.min(55, Math.max(5, Number(input.afterDelaySeconds) || 30)),
     timeZone: String(input.timeZone || DEFAULTS.timeZone).trim() || DEFAULTS.timeZone,
     feeds,
     maxItemsPerFeed: Math.min(30, Math.max(1, Number(input.maxItemsPerFeed) || 8)),
@@ -143,15 +146,8 @@ function cleanSettings(body) {
     loopBed: input.loopBed !== false,
     lastRunAt: input.lastRunAt || null,
     lastRunStatus: input.lastRunStatus || null,
+    lastScheduleSlot: input.lastScheduleSlot || null,
   };
-}
-
-async function syncSuppressFlag(config) {
-  if (config.enabled && config.scheduleMode === 'replace') {
-    await writeFile(SUPPRESS_FILE, 'replace\n');
-  } else {
-    await rm(SUPPRESS_FILE, { force: true });
-  }
 }
 
 async function log(message) {
@@ -210,7 +206,7 @@ async function fetchFeed(feed, maxItems) {
     const response = await fetch(feed.url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'SUBWAVE-News-Bulletin/0.1 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
+        'User-Agent': 'SUBWAVE-News-Bulletin/0.2 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
       },
     });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -264,34 +260,271 @@ async function skillBrief() {
   }
 }
 
-async function renderVoice(config, candidates) {
-  const brief = await skillBrief();
+async function controllerRequest(path, options = {}) {
+  const headers = { ...(options.headers || {}), Authorization: authHeader() };
+  const response = await fetch(`${CONTROLLER_URL}${path}`, { ...options, headers });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`SUB/WAVE ${path} failed (${response.status}): ${text || response.statusText}`);
+  }
+  return response;
+}
+
+async function subwaveSnapshot() {
+  const response = await controllerRequest('/settings');
+  const api = await response.json();
+  const raw = await loadJson(RAW_SUBWAVE_SETTINGS, {});
+  const values = api?.values || {};
+  const personas = Array.isArray(values.personas) ? values.personas : [];
+  const activeId = api?.onAir?.personaId || values.activePersonaId || raw.activePersonaId;
+  const persona = personas.find((item) => item?.id === activeId) || personas[0] || {
+    name: 'SUB/WAVE DJ', tagline: '', soul: '', humour: 5, localColour: 5, warmth: 5,
+    language: 'English', tts: {},
+  };
+  return { api, raw, values, persona };
+}
+
+function toneLine(label, value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '';
+  if (n <= 3) return `${label}: low`;
+  if (n >= 7) return `${label}: high`;
+  return `${label}: balanced`;
+}
+
+function buildPrompts(snapshot, config, candidates, brief) {
+  const { persona, values } = snapshot;
+  const station = values.station || 'SUB/WAVE';
+  const location = values.weather?.onAirLocation || values.weather?.locationName || '';
   const rows = candidates.map((item, index) => (
     `${index + 1}. [${item.source}] ${item.title}${item.description ? ` — ${item.description}` : ''}`
   )).join('\n');
+  const tone = [
+    toneLine('Humour', persona.humour),
+    toneLine('Local colour', persona.localColour),
+    toneLine('Warmth', persona.warmth),
+  ].filter(Boolean).join('; ');
 
-  const instruction = `${brief}
+  const system = `You are ${persona.name || 'the DJ'}, the on-air presenter for ${station}.${location ? ` The station is based around ${location}.` : ''}
+Persona tagline: ${persona.tagline || '(none)'}
+Persona description: ${persona.soul || 'natural, concise radio presenter'}
+Tone controls: ${tone || 'balanced'}
+Language: ${persona.language || 'English'}
 
-Use no more than ${config.maxHeadlines} stories and keep the script under approximately ${config.maxLengthSeconds} seconds when spoken.
+Output only words that should be spoken aloud. Do not output headings, bullets, stage directions, citations, URLs, markdown, or quotation marks around the script. Preserve the persona's voice, but accuracy and restraint outrank jokes during serious news.`;
+
+  const user = `${brief}
+
+Use no more than ${config.maxHeadlines} stories and keep the script under approximately ${config.maxLengthSeconds} seconds when spoken. Prioritise Australian news, followed by major world news. Only use facts present in the supplied candidates. Do not merge unrelated stories or invent context. Avoid jokes about death, disasters, victims, war, or serious crime.
 
 Fresh candidate headlines:
 ${rows}
 
-Return only the spoken bulletin. Do not include stage directions, labels, bullet numbers, URLs, or notes to the operator.`;
+Return only the finished spoken bulletin.`;
+  return { system, user };
+}
 
-  const response = await fetch(`${CONTROLLER_URL}/dj/render-voice`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: authHeader(),
-    },
-    body: JSON.stringify({ text: instruction, mode: 'styled', kind: 'dj-speak' }),
-  });
+function secret(name) {
+  return process.env[name] || stateSecrets[name] || '';
+}
+
+function trimOutput(value) {
+  return String(value || '')
+    .replace(/^```(?:text)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .replace(/^(?:script|bulletin|news bulletin)\s*:\s*/i, '')
+    .replace(/^['"]|['"]$/g, '')
+    .trim();
+}
+
+function providerKey(provider, rawLlm = {}) {
+  const inline = rawLlm?.keys?.[provider] || '';
+  if (inline && inline !== 'set') return inline;
+  const envMap = {
+    openai: 'OPENAI_API_KEY',
+    anthropic: 'ANTHROPIC_API_KEY',
+    google: 'GOOGLE_GENERATIVE_AI_API_KEY',
+    deepseek: 'DEEPSEEK_API_KEY',
+    openrouter: 'OPENROUTER_API_KEY',
+    requesty: 'REQUESTY_API_KEY',
+    gateway: 'AI_GATEWAY_API_KEY',
+  };
+  return envMap[provider] ? secret(envMap[provider]) : '';
+}
+
+function baseUrlFor(provider, leg, rawLlm = {}) {
+  const urls = leg?.providerBaseUrls || rawLlm?.providerBaseUrls || {};
+  if (provider === 'locca') return (urls.locca || 'http://host.docker.internal:8080/v1').replace(/\/$/, '');
+  if (provider === 'openai-compatible') return String(urls['openai-compatible'] || '').replace(/\/$/, '');
+  if (provider === 'requesty') return String(urls.requesty || 'https://router.requesty.ai/v1').replace(/\/$/, '');
+  if (provider === 'gateway') return String(urls.gateway || '').replace(/\/$/, '');
+  return '';
+}
+
+async function fetchJson(url, init, timeoutMs = 45000) {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   const text = await response.text();
-  if (!response.ok) throw new Error(`SUB/WAVE render failed (${response.status}): ${text}`);
-  const body = JSON.parse(text);
-  if (!body.wavPath || !body.spoken) throw new Error('SUB/WAVE returned no rendered voice.');
-  return body;
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 500)}`);
+  try { return JSON.parse(text); } catch { throw new Error(`Provider returned invalid JSON: ${text.slice(0, 200)}`); }
+}
+
+async function generateWithLeg(leg, rawLlm, prompts) {
+  const provider = String(leg?.provider || '').trim();
+  const model = String(leg?.model || '').trim();
+  if (!provider || !model) throw new Error('SUB/WAVE has no LLM provider/model configured.');
+  const maxTokens = Math.max(256, Math.min(2048, Number(rawLlm?.maxOutputTokens) || 900));
+
+  if (provider === 'ollama') {
+    const base = String(leg.ollamaUrl || rawLlm.ollamaUrl || 'http://host.docker.internal:11434').replace(/\/$/, '');
+    const body = await fetchJson(`${base}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        messages: [
+          { role: 'system', content: prompts.system },
+          { role: 'user', content: prompts.user },
+        ],
+        options: {
+          num_ctx: Number(leg.numCtx || rawLlm.numCtx) || undefined,
+          repeat_penalty: Number(leg.repeatPenalty || rawLlm.repeatPenalty) || undefined,
+          temperature: 0.35,
+        },
+      }),
+    }, 90000);
+    return trimOutput(body?.message?.content || body?.response);
+  }
+
+  if (provider === 'anthropic') {
+    const key = providerKey(provider, rawLlm);
+    if (!key) throw new Error('ANTHROPIC_API_KEY is not available to the companion.');
+    const body = await fetchJson('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        temperature: 0.35,
+        system: prompts.system,
+        messages: [{ role: 'user', content: prompts.user }],
+      }),
+    });
+    return trimOutput((body?.content || []).map((item) => item?.text || '').join('\n'));
+  }
+
+  if (provider === 'google') {
+    const key = providerKey(provider, rawLlm);
+    if (!key) throw new Error('GOOGLE_GENERATIVE_AI_API_KEY is not available to the companion.');
+    const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: prompts.system }] },
+        contents: [{ role: 'user', parts: [{ text: prompts.user }] }],
+        generationConfig: { temperature: 0.35, maxOutputTokens: maxTokens },
+      }),
+    });
+    return trimOutput(body?.candidates?.[0]?.content?.parts?.map((part) => part?.text || '').join('\n'));
+  }
+
+  let base = '';
+  let key = providerKey(provider, rawLlm);
+  if (provider === 'openai') base = 'https://api.openai.com/v1';
+  else if (provider === 'deepseek') base = 'https://api.deepseek.com/v1';
+  else if (provider === 'openrouter') base = 'https://openrouter.ai/api/v1';
+  else if (['openai-compatible', 'locca', 'requesty', 'gateway'].includes(provider)) {
+    base = baseUrlFor(provider, leg, rawLlm);
+    if (!base) throw new Error(`${provider} has no base URL configured.`);
+  } else {
+    throw new Error(`The companion does not yet support SUB/WAVE LLM provider "${provider}".`);
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (key) headers.Authorization = `Bearer ${key}`;
+  const body = await fetchJson(`${base}/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model,
+      temperature: 0.35,
+      max_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: prompts.system },
+        { role: 'user', content: prompts.user },
+      ],
+    }),
+  });
+  return trimOutput(body?.choices?.[0]?.message?.content);
+}
+
+async function generateBulletinText(snapshot, config, candidates) {
+  const brief = await skillBrief();
+  const prompts = buildPrompts(snapshot, config, candidates, brief);
+  const rawLlm = snapshot.raw?.llm || {};
+  const apiLlm = snapshot.values?.llm || {};
+  const primary = { ...rawLlm, ...apiLlm };
+  try {
+    const text = await generateWithLeg(primary, rawLlm, prompts);
+    if (!text) throw new Error('The configured LLM returned an empty bulletin.');
+    return { text, provider: primary.provider, model: primary.model };
+  } catch (primaryError) {
+    const fallbackRaw = rawLlm?.fallback || {};
+    const fallbackApi = apiLlm?.fallback || {};
+    const fallback = { ...fallbackRaw, ...fallbackApi };
+    if (!fallback.enabled) throw primaryError;
+    await log(`Primary LLM failed; trying fallback: ${primaryError.message}`);
+    const text = await generateWithLeg(fallback, rawLlm, prompts);
+    if (!text) throw new Error('The configured fallback LLM returned an empty bulletin.');
+    return { text, provider: fallback.provider, model: fallback.model };
+  }
+}
+
+function resolveVoice(snapshot) {
+  const persona = snapshot.persona || {};
+  const stationTts = snapshot.values?.tts || {};
+  const requested = persona.tts || {};
+  const engine = requested.engine || stationTts.defaultEngine || 'piper';
+  let voice = requested.voice || '';
+  if (!voice && engine === 'kokoro') voice = stationTts.kokoro?.voice || '';
+  if (!voice && engine === 'chatterbox') voice = stationTts.chatterbox?.referenceVoice || '';
+  if (!voice && engine === 'pocket-tts') voice = stationTts.pocketTts?.voice || '';
+  if (!voice && engine === 'cloud') voice = stationTts.cloud?.voice || '';
+  const cloudProvider = requested.cloudProvider || stationTts.cloud?.provider || 'openai';
+  const engineSpeed = Number(stationTts.speed?.[engine]) || 1;
+  const personaSpeed = Number(requested.speed) || 1;
+  const speed = Math.min(2, Math.max(0.5, engineSpeed * personaSpeed));
+  return {
+    engine,
+    voice,
+    cloudProvider,
+    speed,
+    language: persona.language || 'English',
+    voiceSettings: stationTts.cloud ? {
+      voiceStability: stationTts.cloud.voiceStability,
+      voiceStyle: stationTts.cloud.voiceStyle,
+      voiceSimilarityBoost: stationTts.cloud.voiceSimilarityBoost,
+      voiceUseSpeakerBoost: stationTts.cloud.voiceUseSpeakerBoost,
+    } : undefined,
+  };
+}
+
+async function synthesizeVoice(snapshot, text) {
+  const voice = resolveVoice(snapshot);
+  const response = await controllerRequest('/settings/tts/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...voice, text }),
+  });
+  const contentType = response.headers.get('content-type') || '';
+  const ext = contentType.includes('mpeg') || contentType.includes('mp3') ? 'mp3' : 'wav';
+  const path = join(GENERATED_DIR, `voice-${Date.now()}.${ext}`);
+  await writeFile(path, Buffer.from(await response.arrayBuffer()));
+  return { path, voice };
 }
 
 function run(command, args, options = {}) {
@@ -344,16 +577,40 @@ async function makeBulletinAudio(config, voicePath) {
   return out;
 }
 
-async function waitUntilMissing(path, timeoutMs = 30000) {
+async function makeFullPackage(bulletinPath) {
+  const parts = [];
+  const intro = join(ASSET_DIR, 'intro.wav');
+  const outro = join(ASSET_DIR, 'outro.wav');
+  if (existsSync(intro)) parts.push(intro);
+  parts.push(bulletinPath);
+  if (existsSync(outro)) parts.push(outro);
+
+  const out = join(GENERATED_DIR, `news-package-${Date.now()}.wav`);
+  if (parts.length === 1) {
+    await copyFile(parts[0], out);
+    return out;
+  }
+
+  const inputs = parts.flatMap((path) => ['-i', path]);
+  const labels = parts.map((_, index) => `[${index}:a]`).join('');
+  run('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    ...inputs,
+    '-filter_complex', `${labels}concat=n=${parts.length}:v=0:a=1[out]`,
+    '-map', '[out]', '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', out,
+  ]);
+  return out;
+}
+
+async function waitUntilMissing(path, timeoutMs = 90000) {
   const deadline = Date.now() + timeoutMs;
   while (existsSync(path)) {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${basename(path)}`);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
   }
 }
 
 async function queueAudio(path) {
-  if (!existsSync(path)) return;
   await waitUntilMissing(SAY_FILE);
   const tmp = join(STATE_DIR, `.hourly-news-say-${process.pid}-${Date.now()}.tmp`);
   await writeFile(tmp, `${path}\n`);
@@ -371,14 +628,12 @@ async function runBulletin(reason = 'manual') {
     const { candidates, ledger } = await collectHeadlines(config);
     if (!candidates.length) throw new Error('There are no fresh headlines to read.');
 
-    const rendered = await renderVoice(config, candidates);
-    const bulletin = await makeBulletinAudio(config, rendered.wavPath);
-    const intro = join(ASSET_DIR, 'intro.wav');
-    const outro = join(ASSET_DIR, 'outro.wav');
-
-    if (existsSync(intro)) await queueAudio(intro);
-    await queueAudio(bulletin);
-    if (existsSync(outro)) await queueAudio(outro);
+    const snapshot = await subwaveSnapshot();
+    const generated = await generateBulletinText(snapshot, config, candidates);
+    const speech = await synthesizeVoice(snapshot, generated.text);
+    const bulletin = await makeBulletinAudio(config, speech.path);
+    const packagePath = await makeFullPackage(bulletin);
+    await queueAudio(packagePath);
 
     for (const item of candidates) ledger.add(item.key);
     await saveJson(SEEN_FILE, {
@@ -392,8 +647,8 @@ async function runBulletin(reason = 'manual') {
       lastRunStatus: 'ok',
     };
     await saveJson(SETTINGS_FILE, latest);
-    await log(`Bulletin completed: ${rendered.spoken}`);
-    return { ok: true, spoken: rendered.spoken };
+    await log(`Bulletin queued using ${generated.provider}/${generated.model}, ${speech.voice.engine}/${speech.voice.voice || 'default'}: ${generated.text}`);
+    return { ok: true, spoken: generated.text };
   } catch (error) {
     const latest = {
       ...config,
@@ -407,10 +662,10 @@ async function runBulletin(reason = 'manual') {
     runBusy = false;
     try {
       const names = (await readdir(GENERATED_DIR))
-        .filter((name) => name.endsWith('.wav'))
+        .filter((name) => /\.(wav|mp3)$/i.test(name))
         .sort()
         .reverse();
-      await Promise.all(names.slice(8).map((name) => rm(join(GENERATED_DIR, name), { force: true })));
+      await Promise.all(names.slice(24).map((name) => rm(join(GENERATED_DIR, name), { force: true })));
     } catch {}
   }
 }
@@ -433,10 +688,8 @@ function zonedParts(timeZone) {
   };
 }
 
-let lastScheduleKey = '';
 async function scheduleTick() {
   const config = await settings();
-  await syncSuppressFlag(config);
   if (!config.enabled || config.scheduleMode === 'manual' || runBusy) return;
 
   let parts;
@@ -450,19 +703,17 @@ async function scheduleTick() {
   let due = false;
   let slotHour = parts.hour;
   if (config.scheduleMode === 'after') {
-    due = parts.minute === 0 && parts.second >= config.afterDelaySeconds;
+    due = parts.minute === 1;
   } else if (config.scheduleMode === 'before') {
-    due = parts.minute === 59 && parts.second >= 20;
+    due = parts.minute === 59;
     slotHour = (parts.hour + 1) % 24;
-  } else if (config.scheduleMode === 'replace') {
-    due = parts.minute === 0 && parts.second >= 2;
   } else if (config.scheduleMode === 'custom') {
-    due = parts.minute === config.customMinute && parts.second >= 2;
+    due = parts.minute === config.customMinute;
   }
 
   const key = `${parts.year}-${parts.month}-${parts.day}-${slotHour}-${config.scheduleMode}`;
-  if (due && key !== lastScheduleKey) {
-    lastScheduleKey = key;
+  if (due && key !== config.lastScheduleSlot) {
+    await saveJson(SETTINGS_FILE, { ...config, lastScheduleSlot: key });
     runBulletin(`schedule:${config.scheduleMode}`).catch((error) => log(error.message));
   }
 }
@@ -502,6 +753,7 @@ async function versionStatus() {
   try {
     const response = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/commits/main`, {
       headers: { 'User-Agent': 'SUBWAVE-News-Bulletin' },
+      signal: AbortSignal.timeout(10000),
     });
     if (response.ok) latestCommit = (await response.json()).sha;
   } catch {}
@@ -513,17 +765,33 @@ async function versionStatus() {
   };
 }
 
-function startManage(command) {
-  const child = spawn('bash', [join(EXTENSION_DIR, 'manage.sh'), command], {
-    detached: true,
-    stdio: 'ignore',
-    cwd: EXTENSION_DIR,
-    env: { ...process.env },
-  });
-  child.unref();
+function updaterContainer(command) {
+  const name = `subwave-news-${command}-${Date.now()}`;
+  const args = [
+    'run', '-d', '--rm', '--name', name,
+    '-v', '/var/run/docker.sock:/var/run/docker.sock',
+    '-v', `${EXTENSION_DIR}:${EXTENSION_DIR}`,
+    '-v', `${HOST_STATE_DIR}:/var/sub-wave`,
+    '-w', EXTENSION_DIR,
+    '-e', `EXTENSION_DIR=${EXTENSION_DIR}`,
+    '-e', 'SUBWAVE_STATE_DIR=/var/sub-wave',
+    '-e', 'DATA_DIR=/var/sub-wave/extensions/hourly-news',
+    '-e', `SUBWAVE_NETWORK=${SUBWAVE_NETWORK}`,
+    '-e', `MANAGER_PORT=${MANAGER_PORT}`,
+    MANAGER_IMAGE,
+    'bash', './manage.sh', command,
+  ];
+  const result = spawnSync('docker', args, { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error((result.stderr || result.stdout || 'Could not start updater').trim());
+  return result.stdout.trim();
+}
+
+async function rescanSkill() {
+  await controllerRequest('/dj/skills/rescan', { method: 'POST' });
 }
 
 const app = express();
+app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use(requireAuth);
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(join(import.meta.dirname, 'public')));
@@ -542,7 +810,6 @@ app.put('/api/settings', async (req, res) => {
     const previous = await settings();
     const config = cleanSettings({ ...previous, ...req.body });
     await saveJson(SETTINGS_FILE, config);
-    await syncSuppressFlag(config);
     res.json({ ok: true, settings: config });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -561,18 +828,14 @@ app.post('/api/assets/:type', upload.single('file'), async (req, res) => {
 });
 
 app.get('/api/assets/:type', async (req, res) => {
-  if (!['intro', 'bed', 'outro'].includes(req.params.type)) {
-    return res.status(400).send('Unknown asset.');
-  }
+  if (!['intro', 'bed', 'outro'].includes(req.params.type)) return res.status(400).send('Unknown asset.');
   const path = join(ASSET_DIR, `${req.params.type}.wav`);
   if (!existsSync(path)) return res.status(404).send('No audio uploaded.');
   res.type('audio/wav').sendFile(path);
 });
 
 app.delete('/api/assets/:type', async (req, res) => {
-  if (!['intro', 'bed', 'outro'].includes(req.params.type)) {
-    return res.status(400).json({ error: 'Unknown asset.' });
-  }
+  if (!['intro', 'bed', 'outro'].includes(req.params.type)) return res.status(400).json({ error: 'Unknown asset.' });
   await rm(join(ASSET_DIR, `${req.params.type}.wav`), { force: true });
   res.json({ ok: true });
 });
@@ -587,16 +850,27 @@ app.post('/api/run', async (_req, res) => {
 
 app.get('/api/status', async (_req, res) => {
   const config = await settings();
-  const patch = spawnSync('python3', [
-    join(EXTENSION_DIR, 'patches/patch_subwave.py'),
-    'check', '--subwave-dir', SUBWAVE_DIR,
-  ], { encoding: 'utf8' });
+  let subwave = { connected: false, error: null, persona: null, llm: null, tts: null };
+  try {
+    const snapshot = await subwaveSnapshot();
+    const llm = snapshot.values?.llm || snapshot.raw?.llm || {};
+    const voice = resolveVoice(snapshot);
+    subwave = {
+      connected: true,
+      error: null,
+      persona: snapshot.persona?.name || null,
+      llm: `${llm.provider || '?'} / ${llm.model || '?'}`,
+      tts: `${voice.engine} / ${voice.voice || 'default'}`,
+    };
+  } catch (error) {
+    subwave.error = error.message;
+  }
   res.json({
     manager: 'running',
     busy: runBusy,
-    patchInstalled: patch.status === 0,
     lastRunAt: config.lastRunAt,
     lastRunStatus: config.lastRunStatus,
+    subwave,
     ...(await versionStatus()),
   });
 });
@@ -611,20 +885,24 @@ app.get('/api/logs', async (_req, res) => {
 });
 
 app.post('/api/update', (_req, res) => {
-  startManage('update-internal');
-  res.json({ ok: true, message: 'Update started. This page may disconnect while the manager restarts.' });
-});
-
-app.post('/api/reapply', (_req, res) => {
-  startManage('reapply');
-  res.json({ ok: true, message: 'Reapply started. The SUB/WAVE controller will restart.' });
+  try {
+    updaterContainer('update-worker');
+    res.json({ ok: true, message: 'Update started. The page may disconnect briefly while the manager restarts.' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/rollback', (_req, res) => {
-  startManage('rollback');
-  res.json({ ok: true, message: 'Rollback started. This page may disconnect while the manager restarts.' });
+  try {
+    updaterContainer('rollback-worker');
+    res.json({ ok: true, message: 'Rollback started. The page may disconnect briefly while the manager restarts.' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  log(`Hourly News Manager listening on port ${PORT}.`).catch(() => {});
+  log(`Hourly News Manager listening on port ${PORT}. No SUB/WAVE source files are modified.`).catch(() => {});
+  rescanSkill().catch((error) => log(`Skill rescan warning: ${error.message}`));
 });

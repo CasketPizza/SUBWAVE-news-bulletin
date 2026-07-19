@@ -1,5 +1,6 @@
 services:
   news-bulletin-manager:
+    image: subwave-news-bulletin-manager:local
     build:
       context: ./manager
     container_name: subwave-news-bulletin
@@ -11,18 +12,20 @@ services:
     environment:
       PORT: "7711"
       EXTENSION_DIR: "${EXTENSION_DIR}"
-      SUBWAVE_DIR: "${SUBWAVE_DIR}"
       STATE_DIR: "/var/sub-wave"
       HOST_STATE_DIR: "${SUBWAVE_STATE_DIR}"
+      SUBWAVE_NETWORK: "${SUBWAVE_NETWORK}"
+      MANAGER_PORT: "${MANAGER_PORT:-7711}"
+      MANAGER_IMAGE: "subwave-news-bulletin-manager:local"
+      CONTROLLER_URL: "http://controller:7701"
       TZ: "${TZ:-Australia/Sydney}"
-      HOST_UID: "${HOST_UID:-1000}"
-      HOST_GID: "${HOST_GID:-1000}"
       GITHUB_REPO: "CasketPizza/SUBWAVE-news-bulletin"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "${EXTENSION_DIR}:${EXTENSION_DIR}"
-      - "${SUBWAVE_DIR}:${SUBWAVE_DIR}"
       - "${SUBWAVE_STATE_DIR}:/var/sub-wave"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - subwave
 
