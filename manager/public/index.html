@@ -160,6 +160,7 @@
 
     <section>
       <h2>Audio package</h2>
+      <p class="hint">Choosing a file uploads and selects it immediately. The original file name is shown once conversion finishes.</p>
       <label class="toggle programme-toggle"><input id="interruptCurrentTrack" type="checkbox"> End the current song and air the bulletin as a standalone programme item</label>
       <p class="hint">When enabled, SUB/WAVE skips the current song, moves any pending songs behind the complete intro/news/outro package, and starts the next queued or automatic song only after the package finishes. The handover into the intro uses SUB/WAVE’s normal skip transition. Disable this only to use ordinary foreground-voice ducking instead.</p>
       <div class="audio-grid">
@@ -167,22 +168,22 @@
           <h3>Intro jingle</h3>
           <p>Plays before the bulletin.</p>
           <input id="introFile" type="file" accept="audio/*">
-          <div class="actions"><button data-upload="intro">Upload</button><button data-preview="intro">Preview</button><button data-remove="intro">Remove</button></div>
-          <span id="introState" class="asset-state"></span>
+          <div class="actions"><button data-preview="intro">Preview</button><button data-remove="intro">Remove</button></div>
+          <span id="introState" class="asset-state" aria-live="polite"></span>
         </article>
         <article class="audio-card">
           <h3>Background music</h3>
           <p>Mixed underneath the generated headlines.</p>
           <input id="bedFile" type="file" accept="audio/*">
-          <div class="actions"><button data-upload="bed">Upload</button><button data-preview="bed">Preview</button><button data-remove="bed">Remove</button></div>
-          <span id="bedState" class="asset-state"></span>
+          <div class="actions"><button data-preview="bed">Preview</button><button data-remove="bed">Remove</button></div>
+          <span id="bedState" class="asset-state" aria-live="polite"></span>
         </article>
         <article class="audio-card">
           <h3>Outro jingle</h3>
           <p>Plays after the bulletin.</p>
           <input id="outroFile" type="file" accept="audio/*">
-          <div class="actions"><button data-upload="outro">Upload</button><button data-preview="outro">Preview</button><button data-remove="outro">Remove</button></div>
-          <span id="outroState" class="asset-state"></span>
+          <div class="actions"><button data-preview="outro">Preview</button><button data-remove="outro">Remove</button></div>
+          <span id="outroState" class="asset-state" aria-live="polite"></span>
         </article>
       </div>
       <div class="grid four">

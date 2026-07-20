@@ -1,5 +1,19 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.9 fixes and interface improvements
+
+- Repairs update detection by marking the mounted checkout as a safe Git directory,
+  comparing both the remote `main` commit and its uncached `VERSION` file, and
+  reducing the passive update-check cache to one minute.
+- Refreshes the Recent log every two seconds while the browser tab is visible and
+  pauses polling while the page is hidden. The panel stays pinned to the newest
+  line when the operator is already at the bottom.
+- Keeps **Save settings** floating above the page so it remains available while
+  editing any section.
+- Uploads intro, bed, and outro audio immediately after a file is selected. The
+  converted asset is used at once and its original file name is stored and shown
+  in the UI instead of the generic “Uploaded and ready” label.
+
 ## v0.5.8 fixes
 
 - Fixes the v0.5.7 prepared-request detector incorrectly excluding the resolver
@@ -263,8 +277,9 @@ Check for updates → Update now
 The updater changes only this companion repository and container. It preserves
 feeds, schedule settings, newsroom instructions, presenter/voice selection,
 seen-headline history, and uploaded audio under SUB/WAVE's persistent state. The
-update check uses the repository's configured `origin` and caches background
-checks for five minutes; pressing **Check for updates** forces a fresh comparison.
+update check compares the installed checkout with the repository's remote
+`main` commit and uncached `VERSION` file. Background checks are cached for one
+minute; pressing **Check for updates** forces a fresh comparison.
 Updater and rollback workers also restore the checkout's original owner after a
 root-run Docker build, so later manual commands remain writable by the VM user.
 

@@ -4,6 +4,7 @@ let assets = {};
 let options = {};
 let instructionDefaults = {};
 let noticeTimer = null;
+let logRefreshTimer = null;
 
 // The manager is normally reverse-proxied below /news-bulletin/. Resolve every
 // request relative to the page so the same build also works directly at /.
@@ -205,9 +206,20 @@ function collect() {
   };
 }
 
+function assetRecord(type) {
+  const value = assets[type];
+  if (value && typeof value === 'object') return value;
+  if (value === true) return { uploaded: true, fileName: `${type}.wav` };
+  return null;
+}
+
 function updateAssetStates() {
   for (const type of ['intro', 'bed', 'outro']) {
-    $(`${type}State`).textContent = assets[type] ? 'Uploaded and ready' : 'No audio uploaded';
+    const state = $(`${type}State`);
+    const asset = assetRecord(type);
+    state.textContent = asset?.fileName || 'No audio uploaded';
+    state.title = asset?.fileName || '';
+    state.classList.toggle('ready', Boolean(asset));
   }
 }
 
@@ -224,26 +236,40 @@ async function save() {
 
 async function uploadAsset(type) {
   const input = $(`${type}File`);
-  if (!input.files[0]) throw new Error('Choose an audio file first.');
-  const form = new FormData();
-  form.append('file', input.files[0]);
-  await api(`/api/assets/${type}`, { method: 'POST', body: form });
-  assets[type] = true;
-  input.value = '';
-  updateAssetStates();
-  notice(`${type === 'bed' ? 'Background music' : `${type} jingle`} uploaded.`);
+  const file = input.files[0];
+  if (!file) return;
+  const state = $(`${type}State`);
+  const previous = assets[type];
+  input.disabled = true;
+  state.textContent = `Uploading ${file.name}…`;
+  state.classList.remove('ready');
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const result = await api(`/api/assets/${type}`, { method: 'POST', body: form });
+    assets[type] = result.asset || { uploaded: true, fileName: file.name };
+    updateAssetStates();
+    notice(`${type === 'bed' ? 'Background music' : `${type} jingle`} uploaded and selected: ${file.name}`);
+  } catch (error) {
+    assets[type] = previous;
+    updateAssetStates();
+    throw error;
+  } finally {
+    input.value = '';
+    input.disabled = false;
+  }
 }
 
 async function removeAsset(type) {
   await api(`/api/assets/${type}`, { method: 'DELETE' });
-  assets[type] = false;
+  assets[type] = null;
   updateAssetStates();
   $('preview').classList.add('hidden');
   notice('Audio removed.');
 }
 
 function previewAsset(type) {
-  if (!assets[type]) return notice('No audio has been uploaded for that field.', true);
+  if (!assetRecord(type)) return notice('No audio has been uploaded for that field.', true);
   const player = $('preview');
   player.src = localUrl(`/api/assets/${type}?t=${Date.now()}`);
   player.classList.remove('hidden');
@@ -254,10 +280,15 @@ async function loadStatus(forceUpdateCheck = false) {
   const status = await api(`/api/status${forceUpdateCheck ? '?refresh=1' : ''}`);
   $('managerStatus').textContent = status.busy ? 'Preparing bulletin…' : 'Running';
   $('versionStatus').textContent = status.updateAvailable
-    ? `${status.version} — update available`
+    ? `${status.version}${status.latestVersion ? ` → ${status.latestVersion}` : ''} — update available`
     : status.updateCheckError
       ? `${status.version} — update check unavailable`
       : status.version;
+  $('versionStatus').title = [
+    status.installedCommit ? `Installed: ${status.installedCommit.slice(0, 12)}` : '',
+    status.latestCommit ? `Remote: ${status.latestCommit.slice(0, 12)}` : '',
+    status.updateCheckedAt ? `Checked: ${new Date(status.updateCheckedAt).toLocaleString()}` : '',
+  ].filter(Boolean).join(' | ');
   $('subwaveStatus').textContent = status.subwave?.connected ? 'Connected' : `Error: ${status.subwave?.error || 'unreachable'}`;
   $('personaStatus').textContent = status.subwave?.persona || 'Unknown';
   $('llmStatus').textContent = status.subwave?.llm || 'Unknown';
@@ -269,7 +300,23 @@ async function loadStatus(forceUpdateCheck = false) {
 }
 
 async function loadLogs() {
-  $('logs').textContent = await api('/api/logs');
+  const panel = $('logs');
+  const previousScrollTop = panel.scrollTop;
+  const nearBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 32;
+  const text = await api('/api/logs');
+  if (panel.textContent === text) return;
+  panel.textContent = text;
+  if (nearBottom || panel.dataset.loaded !== '1') panel.scrollTop = panel.scrollHeight;
+  else panel.scrollTop = previousScrollTop;
+  panel.dataset.loaded = '1';
+}
+
+function setLogAutoRefresh() {
+  clearInterval(logRefreshTimer);
+  logRefreshTimer = null;
+  if (document.visibilityState !== 'visible') return;
+  loadLogs().catch(() => {});
+  logRefreshTimer = setInterval(() => loadLogs().catch(() => {}), 2000);
 }
 
 async function command(path, message) {
@@ -304,9 +351,9 @@ $('runNow').onclick = async () => {
   }
 };
 
-document.querySelectorAll('[data-upload]').forEach((button) => {
-  button.onclick = () => uploadAsset(button.dataset.upload).catch((error) => notice(error.message, true));
-});
+for (const type of ['intro', 'bed', 'outro']) {
+  $(`${type}File`).onchange = () => uploadAsset(type).catch((error) => notice(error.message, true));
+}
 document.querySelectorAll('[data-remove]').forEach((button) => {
   button.onclick = () => removeAsset(button.dataset.remove).catch((error) => notice(error.message, true));
 });
@@ -315,11 +362,24 @@ document.querySelectorAll('[data-preview]').forEach((button) => {
 });
 
 $('checkUpdate').onclick = async () => {
-  const status = await loadStatus(true);
-  if (status.updateCheckError) {
-    notice(`Could not check for updates: ${status.updateCheckError}`, true);
-  } else {
-    notice(status.updateAvailable ? 'An update is available.' : 'You are up to date.');
+  const button = $('checkUpdate');
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Checking…';
+  try {
+    const status = await loadStatus(true);
+    if (status.updateCheckError) {
+      notice(`Could not check for updates: ${status.updateCheckError}`, true);
+    } else if (status.updateAvailable) {
+      notice(`Update available${status.latestVersion ? `: ${status.version} → ${status.latestVersion}` : '.'}`);
+    } else {
+      notice(`You are up to date${status.version ? ` (${status.version})` : ''}.`);
+    }
+  } catch (error) {
+    notice(`Could not check for updates: ${error.message}`, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
   }
 };
 $('updateNow').onclick = () => command('/api/update', 'Update started.').catch((error) => notice(error.message, true));
@@ -327,5 +387,10 @@ $('rollback').onclick = () => command('/api/rollback', 'Rollback started.').catc
 $('refreshProxy').onclick = () => command('/api/proxy/refresh', 'SUB/WAVE path refreshed.').catch((error) => notice(error.message, true));
 $('refreshLogs').onclick = () => loadLogs().catch((error) => notice(error.message, true));
 
-load().catch((error) => notice(error.message, true));
-setInterval(() => loadStatus().catch(() => {}), 15000);
+document.addEventListener('visibilitychange', setLogAutoRefresh);
+window.addEventListener('focus', setLogAutoRefresh);
+
+load().then(setLogAutoRefresh).catch((error) => notice(error.message, true));
+setInterval(() => {
+  if (document.visibilityState === 'visible') loadStatus().catch(() => {});
+}, 15000);

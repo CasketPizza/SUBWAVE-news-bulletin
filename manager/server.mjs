@@ -28,6 +28,7 @@ const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 const SEEN_FILE = join(DATA_DIR, 'seen.json');
 const HEADLINES_CACHE_FILE = join(DATA_DIR, 'headlines-cache.json');
 const LOG_FILE = join(DATA_DIR, 'manager.log');
+const ASSET_META_FILE = join(DATA_DIR, 'assets.json');
 const SAY_FILE = join(STATE_DIR, 'say.txt');
 const NOW_PLAYING_FILE = join(STATE_DIR, 'now-playing.json');
 const SKILL_FILE = join(STATE_DIR, 'skills/hourly-news-bulletin/SKILL.md');
@@ -138,6 +139,28 @@ async function saveJson(path, value) {
 
 async function settings() {
   return { ...DEFAULTS, ...(await loadJson(SETTINGS_FILE, DEFAULTS)) };
+}
+
+
+const ASSET_TYPES = ['intro', 'bed', 'outro'];
+
+async function assetMetadata() {
+  const value = await loadJson(ASSET_META_FILE, {});
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+async function assetSnapshot() {
+  const metadata = await assetMetadata();
+  const result = {};
+  for (const type of ASSET_TYPES) {
+    const uploaded = existsSync(join(ASSET_DIR, `${type}.wav`));
+    result[type] = uploaded ? {
+      uploaded: true,
+      fileName: String(metadata[type]?.fileName || `${type}.wav`).slice(0, 255),
+      uploadedAt: metadata[type]?.uploadedAt || null,
+    } : null;
+  }
+  return result;
 }
 
 function cleanInstruction(value, fallback) {
@@ -1488,16 +1511,16 @@ async function convertUpload(file, type) {
 }
 
 function git(args) {
-  return run('git', ['-C', EXTENSION_DIR, ...args]);
+  return run('git', ['-c', `safe.directory=${EXTENSION_DIR}`, '-C', EXTENSION_DIR, ...args]);
 }
 
-const VERSION_CHECK_TTL_MS = 5 * 60 * 1000;
+const VERSION_CHECK_TTL_MS = 60 * 1000;
 let remoteVersionCache = null;
 
 function remoteMainCommit() {
   const result = spawnSync(
     'git',
-    ['-C', EXTENSION_DIR, 'ls-remote', '--heads', 'origin', 'refs/heads/main'],
+    ['-c', `safe.directory=${EXTENSION_DIR}`, '-C', EXTENSION_DIR, 'ls-remote', '--heads', 'origin', 'refs/heads/main'],
     { encoding: 'utf8', timeout: 15000 },
   );
   if (result.error) throw result.error;
@@ -1509,32 +1532,58 @@ function remoteMainCommit() {
   return sha;
 }
 
+async function remoteMainVersion() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/VERSION?cache=${Date.now()}`;
+    const response = await fetch(url, {
+      signal: controller.signal,
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+    });
+    if (!response.ok) throw new Error(`remote VERSION returned HTTP ${response.status}`);
+    const value = (await response.text()).trim();
+    if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(value)) {
+      throw new Error('remote VERSION did not contain a valid release number');
+    }
+    return value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function versionStatus(force = false) {
   let installedCommit = null;
   let latestCommit = null;
+  let latestVersion = null;
   let version = 'unknown';
-  let updateCheckError = null;
-  try { installedCommit = git(['rev-parse', 'HEAD']); } catch {}
-  try { version = (await readFile(join(EXTENSION_DIR, 'VERSION'), 'utf8')).trim(); } catch {}
+  const errors = [];
+  try { installedCommit = git(['rev-parse', 'HEAD']); } catch (error) { errors.push(`installed commit: ${error.message}`); }
+  try { version = (await readFile(join(EXTENSION_DIR, 'VERSION'), 'utf8')).trim(); } catch (error) { errors.push(`installed VERSION: ${error.message}`); }
 
   const now = Date.now();
   if (!force && remoteVersionCache && now - remoteVersionCache.checkedAt < VERSION_CHECK_TTL_MS) {
-    ({ latestCommit, updateCheckError } = remoteVersionCache);
+    ({ latestCommit, latestVersion } = remoteVersionCache);
+    if (remoteVersionCache.updateCheckError) errors.push(remoteVersionCache.updateCheckError);
   } else {
-    try {
-      latestCommit = remoteMainCommit();
-    } catch (error) {
-      updateCheckError = error.message;
-    }
-    remoteVersionCache = { latestCommit, updateCheckError, checkedAt: now };
+    const remoteErrors = [];
+    try { latestCommit = remoteMainCommit(); } catch (error) { remoteErrors.push(`remote commit: ${error.message}`); }
+    try { latestVersion = await remoteMainVersion(); } catch (error) { remoteErrors.push(`remote VERSION: ${error.message}`); }
+    const updateCheckError = (!latestCommit && !latestVersion) ? remoteErrors.join('; ') : null;
+    remoteVersionCache = { latestCommit, latestVersion, updateCheckError, checkedAt: now };
+    if (updateCheckError) errors.push(updateCheckError);
   }
 
+  const commitDiffers = Boolean(installedCommit && latestCommit && installedCommit !== latestCommit);
+  const versionDiffers = Boolean(version !== 'unknown' && latestVersion && version !== latestVersion);
   return {
     version,
+    latestVersion,
     installedCommit,
     latestCommit,
-    updateAvailable: Boolean(installedCommit && latestCommit && installedCommit !== latestCommit),
-    updateCheckError,
+    updateAvailable: commitDiffers || versionDiffers,
+    updateCheckError: (!latestCommit && !latestVersion) ? (errors.join('; ') || 'No remote release information was available.') : null,
     updateCheckedAt: remoteVersionCache ? new Date(remoteVersionCache.checkedAt).toISOString() : null,
   };
 }
@@ -1616,10 +1665,7 @@ app.use(express.static(join(import.meta.dirname, 'public')));
 
 app.get('/api/settings', async (_req, res) => {
   const config = await settings();
-  const assets = {};
-  for (const type of ['intro', 'bed', 'outro']) {
-    assets[type] = existsSync(join(ASSET_DIR, `${type}.wav`));
-  }
+  const assets = await assetSnapshot();
 
   let options = {
     onAirPersonaId: '',
@@ -1660,9 +1706,17 @@ app.put('/api/settings', async (req, res) => {
 
 app.post('/api/assets/:type', upload.single('file'), async (req, res) => {
   try {
+    if (!ASSET_TYPES.includes(req.params.type)) throw new Error('Unknown asset.');
     if (!req.file) throw new Error('Choose an audio file first.');
     await convertUpload(req.file, req.params.type);
-    res.json({ ok: true });
+    const metadata = await assetMetadata();
+    metadata[req.params.type] = {
+      fileName: basename(String(req.file.originalname || `${req.params.type}.wav`)).slice(0, 255),
+      uploadedAt: new Date().toISOString(),
+    };
+    await saveJson(ASSET_META_FILE, metadata);
+    const assets = await assetSnapshot();
+    res.json({ ok: true, asset: assets[req.params.type] });
   } catch (error) {
     if (req.file?.path) await rm(req.file.path, { force: true }).catch(() => {});
     res.status(400).json({ error: error.message });
@@ -1670,15 +1724,18 @@ app.post('/api/assets/:type', upload.single('file'), async (req, res) => {
 });
 
 app.get('/api/assets/:type', async (req, res) => {
-  if (!['intro', 'bed', 'outro'].includes(req.params.type)) return res.status(400).send('Unknown asset.');
+  if (!ASSET_TYPES.includes(req.params.type)) return res.status(400).send('Unknown asset.');
   const path = join(ASSET_DIR, `${req.params.type}.wav`);
   if (!existsSync(path)) return res.status(404).send('No audio uploaded.');
   res.type('audio/wav').sendFile(path);
 });
 
 app.delete('/api/assets/:type', async (req, res) => {
-  if (!['intro', 'bed', 'outro'].includes(req.params.type)) return res.status(400).json({ error: 'Unknown asset.' });
+  if (!ASSET_TYPES.includes(req.params.type)) return res.status(400).json({ error: 'Unknown asset.' });
   await rm(join(ASSET_DIR, `${req.params.type}.wav`), { force: true });
+  const metadata = await assetMetadata();
+  delete metadata[req.params.type];
+  await saveJson(ASSET_META_FILE, metadata);
   res.json({ ok: true });
 });
 
