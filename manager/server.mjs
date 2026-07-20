@@ -539,7 +539,11 @@ function bulletinJsonSchema(maxStories) {
         type: 'array',
         minItems: 1,
         maxItems: Math.max(1, Number(maxStories) || 1),
-        items: { type: 'string', minLength: 1 },
+        items: {
+          type: 'string',
+          minLength: 1,
+          description: 'Finished words spoken by the radio presenter only. No analysis, planning, reasoning, instructions, labels, or hidden-thought tags.',
+        },
       },
     },
     required: ['stories'],
@@ -551,13 +555,73 @@ function secret(name) {
   return process.env[name] || stateSecrets[name] || '';
 }
 
-function trimOutput(value) {
-  return String(value || '')
-    .replace(/^```(?:text)?\s*/i, '')
+function stripReasoningBlocks(value) {
+  let text = String(value || '');
+  // Some community GGUF chat templates ignore Ollama's `think:false` switch
+  // and put hidden reasoning directly in message.content. Remove only explicit
+  // reasoning containers here; untagged planning is rejected by the validator
+  // below rather than guessed away and accidentally broadcast.
+  for (const tag of ['think', 'analysis', 'reasoning']) {
+    text = text.replace(new RegExp(String.raw`<${tag}\b[^>]*>[\s\S]*?<\/${tag}>`, 'gi'), ' ');
+  }
+  return text
+    .replace(/^```(?:json|text)?\s*/i, '')
     .replace(/\s*```$/, '')
-    .replace(/^(?:script|bulletin|news bulletin)\s*:\s*/i, '')
+    .trim();
+}
+
+function trimOutput(value) {
+  return stripReasoningBlocks(value)
+    .replace(/^(?:script|bulletin|news bulletin|final answer)\s*:\s*/i, '')
     .replace(/^['"]|['"]$/g, '')
     .trim();
+}
+
+function parseStoryJson(value) {
+  const text = stripReasoningBlocks(value);
+  const accept = (candidate) => {
+    try {
+      const parsed = JSON.parse(candidate);
+      return Array.isArray(parsed?.stories) ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = accept(text);
+  if (direct) return direct;
+
+  // A model may emit untagged planning before the JSON despite structured
+  // output. Extract a balanced JSON object containing `stories` instead of
+  // passing the planning prose to TTS when the direct parse fails.
+  for (let start = 0; start < text.length; start++) {
+    if (text[start] !== '{') continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index++) {
+      const char = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+      } else if (char === '{') {
+        depth += 1;
+      } else if (char === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          const parsed = accept(text.slice(start, index + 1));
+          if (parsed) return parsed;
+          break;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 function splitBulletinStories(value, maxStories) {
@@ -578,7 +642,7 @@ function normalizeForLeakCheck(value) {
   return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-function instructionLeakReason(stories, config) {
+function unsafeOutputReason(stories, config) {
   const text = stories.join('\n');
   const fixedPatterns = [
     /newsroom status/i,
@@ -594,9 +658,23 @@ function instructionLeakReason(stories, config) {
     /tone controls:/i,
     /the (?:user|system) prompt/i,
     /as an ai(?: language model)?/i,
+    /<\/?(?:think|analysis|reasoning)\b/i,
+    /(?:^|\n)\s*(?:analysis|reasoning|thought process|thinking)\s*:/i,
+    /\b(?:json schema|stories array|internal reasoning|chain of thought)\b/i,
+    /\b(?:the prompt|these instructions|the source list|the requested format)\b/i,
   ];
   const fixed = fixedPatterns.find((pattern) => pattern.test(text));
   if (fixed) return `matched ${fixed}`;
+
+  // Finished copy should begin like copy, not like a model planning its answer.
+  // Keep this check anchored to the opening so ordinary quoted phrases such as
+  // “we need to act” inside a real news story are not rejected.
+  for (const story of stories) {
+    const opening = normalizeForLeakCheck(story).slice(0, 360);
+    if (/^(?:okay[,.!?: -]*|alright[,.!?: -]*)?(?:let(?:'s| us) (?:think|analy[sz]e|craft|write|prepare|construct|select)|we (?:need|should|must|have) to|i (?:need|should|must|will|have) to|need to (?:write|craft|produce|select|ensure)|the (?:user|task|prompt) (?:asks|wants|requires|is)|given (?:the|this) prompt|first[, ]+(?:i|we) (?:need|should|will)|to answer this|my approach|here(?:'s| is) (?:the|my) reasoning)\b/i.test(opening)) {
+      return 'began with model planning or reasoning';
+    }
+  }
 
   const spoken = normalizeForLeakCheck(text);
   for (const instruction of [
@@ -676,7 +754,9 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
         format: bulletinJsonSchema(config.maxHeadlines),
         messages: [
           { role: 'system', content: outputPrompts.system },
-          { role: 'user', content: outputPrompts.user },
+          // `/no_think` is included as a second guard for community Qwen GGUF
+          // templates that do not honour Ollama's top-level `think:false` flag.
+          { role: 'user', content: `${outputPrompts.user}\n\n/no_think` },
         ],
         options: {
           num_ctx: Number(leg.numCtx || rawLlm.numCtx) || undefined,
@@ -688,13 +768,14 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
         },
       }),
     }, 180000);
-    const raw = String(body?.message?.content || body?.response || '').trim();
-    try {
-      const parsed = JSON.parse(raw);
-      return { text: raw, stories: Array.isArray(parsed?.stories) ? parsed.stories : null };
-    } catch {
-      return { text: trimOutput(raw), stories: null };
+    const hiddenThinking = String(body?.message?.thinking || '').trim();
+    if (hiddenThinking) {
+      await log(`Ollama returned ${hiddenThinking.length} characters of hidden thinking; discarded before bulletin validation.`);
     }
+    const raw = String(body?.message?.content || body?.response || '').trim();
+    const parsed = parseStoryJson(raw);
+    if (parsed) return { text: raw, stories: parsed.stories };
+    return { text: trimOutput(raw), stories: null };
   }
 
   const outputPrompts = promptsForOutput(prompts, 'markers');
@@ -774,7 +855,7 @@ async function generateStoriesWithLeg(leg, rawLlm, prompts, config, candidates) 
       ...prompts,
       user: `${prompts.user}
 
-RETRY CORRECTION: The previous response was invalid because it repeated instructions, used the wrong output format, or failed to separate the stories. Return only the final words to be spoken on air. Do not repeat any prompt text, section label, rule, source list, or explanation.${expectedMultiple ? ' Include at least two separate stories.' : ''}`,
+RETRY CORRECTION: The previous response was unsafe because it exposed instructions, planning, analysis, reasoning, used the wrong output format, or failed to separate the stories. Do not think aloud. Begin directly with the first finished on-air sentence and return only words the presenter should speak. Do not repeat any prompt text, section label, rule, source list, explanation, analysis, or thought process.${expectedMultiple ? ' Include at least two separate stories.' : ''}\n\n/no_think`,
     };
     const generated = await generateWithLeg(leg, rawLlm, attemptPrompts, config);
     const stories = storiesFromGeneration(generated, config.maxHeadlines);
@@ -783,9 +864,9 @@ RETRY CORRECTION: The previous response was invalid because it repeated instruct
     } else if (expectedMultiple && stories.length < 2) {
       lastReason = 'did not separate multiple stories';
     } else {
-      const leak = instructionLeakReason(stories, config);
+      const leak = unsafeOutputReason(stories, config);
       if (!leak) return { text: stories.join(' '), stories };
-      lastReason = `appeared to repeat prompt instructions (${leak})`;
+      lastReason = `contained unsafe prompt or reasoning leakage (${leak})`;
     }
 
     if (attempt === 1) await log(`LLM bulletin output ${lastReason}; retrying once before TTS.`);

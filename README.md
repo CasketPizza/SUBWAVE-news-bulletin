@@ -1,15 +1,17 @@
 # SUB/WAVE Hourly News Bulletin
 
 
-## v0.5.4 fixes
+## v0.5.5 fixes
 
-- Treats Liquidsoap's `annotate:` RID as a resolver request: a trace ending in
-  `Pushed [...]` is success even when the root RID is then destroyed.
-- Waits for successful URI resolution, performs exactly one handover skip, and
-  no longer reports a playing bulletin as "destroyed before playback".
-- Uses Ollama structured JSON output for the story array, validates every story
-  before TTS, retries once when the model repeats prompt instructions, and
-  refuses to synthesize a contaminated response after the retry.
+- Prevents community Qwen GGUF models from putting their planning or thought
+  process on air when their chat template ignores Ollama's `think: false` flag.
+- Adds `/no_think`, discards Ollama's separate hidden-thinking field, strips
+  explicit `<think>`, `<analysis>`, and `<reasoning>` blocks, and extracts the
+  actual structured story JSON when reasoning appears before it.
+- Rejects untagged model-planning language before TTS and retries once with a
+  stricter correction. If the retry is still contaminated, no audio is made or
+  queued.
+- Keeps the v0.5.4 Liquidsoap resolver-RID handover fix.
 
 A standalone companion for [SUB/WAVE](https://github.com/perminder-klair/subwave).
 It adds an hourly multi-source news bulletin without patching, rebuilding, or
