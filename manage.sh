@@ -78,7 +78,7 @@ set_env_key() {
 }
 
 refresh_detected_networks() {
-  local cid bid edge_id audio_network caddy_network
+  local cid bid edge_id audio_network caddy_network detected_state_dir
   cid="$(controller_id)"
   bid="$(broadcast_id)"
   edge_id="$(caddy_id)"
@@ -90,13 +90,20 @@ refresh_detected_networks() {
   caddy_network="$(first_network "$edge_id")"
   [[ -n "$audio_network" ]] || die "Could not detect a network shared by SUB/WAVE's controller and broadcast services."
   [[ -n "$caddy_network" ]] || die "Could not detect Caddy's Docker network."
+  detected_state_dir="$(docker inspect "$cid" --format '{{range .Mounts}}{{if eq .Destination "/var/sub-wave"}}{{.Source}}{{end}}{{end}}')"
+  [[ -n "$detected_state_dir" ]] || die "Could not detect SUB/WAVE's persistent state mount."
 
+  SUBWAVE_STATE_DIR="$detected_state_dir"
   SUBWAVE_AUDIO_NETWORK="$audio_network"
   SUBWAVE_CONTROLLER_NETWORK="$audio_network"
   SUBWAVE_NETWORK="$audio_network"
   SUBWAVE_CADDY_NETWORK="$caddy_network"
-  export SUBWAVE_AUDIO_NETWORK SUBWAVE_CONTROLLER_NETWORK SUBWAVE_NETWORK SUBWAVE_CADDY_NETWORK
+  export SUBWAVE_STATE_DIR SUBWAVE_AUDIO_NETWORK SUBWAVE_CONTROLLER_NETWORK SUBWAVE_NETWORK SUBWAVE_CADDY_NETWORK
 
+  # Always recover the actual host-side state path from the running controller.
+  # This prevents a container path such as /var/sub-wave from being persisted as
+  # a Docker host bind source during UI updates.
+  set_env_key SUBWAVE_STATE_DIR "$SUBWAVE_STATE_DIR"
   set_env_key SUBWAVE_AUDIO_NETWORK "$SUBWAVE_AUDIO_NETWORK"
   set_env_key SUBWAVE_CONTROLLER_NETWORK "$SUBWAVE_CONTROLLER_NETWORK"
   set_env_key SUBWAVE_NETWORK "$SUBWAVE_NETWORK"

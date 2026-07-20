@@ -1,5 +1,12 @@
 # SUB/WAVE Hourly News Bulletin
 
+
+## v0.5.3 fixes
+
+- Uses Liquidsoap's dedicated request lifecycle lists instead of trying to read a nonexistent `status=` field from `request.metadata`.
+- Performs only one safe skip for an immediate bulletin handover, preventing the bulletin itself and following songs from being skipped while status is checked.
+- Re-detects SUB/WAVE's real host-side state mount during update, restart, and rollback so `/var/sub-wave` cannot be mistakenly saved as a host bind path.
+
 A standalone companion for [SUB/WAVE](https://github.com/perminder-klair/subwave).
 It adds an hourly multi-source news bulletin without patching, rebuilding, or
 replacing any SUB/WAVE application files.

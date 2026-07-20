@@ -960,54 +960,64 @@ async function pushLiquidsoapRequest(uri) {
   return rid;
 }
 
-function requestStatusFromMetadata(metadata) {
-  const match = /^status=([^\r\n]+)/mi.exec(String(metadata || ''));
-  return match ? match[1].trim().toLowerCase() : '';
-}
-
-async function liquidsoapRequestStatus(rid) {
-  try {
-    const metadata = await liquidsoapCommand(`request.metadata ${rid}`, 3000);
-    return { status: requestStatusFromMetadata(metadata), metadata };
-  } catch (error) {
-    return { status: '', metadata: '', error };
-  }
+function requestIds(raw) {
+  return new Set(String(raw || '').match(/\b\d+\b/g) || []);
 }
 
 async function requestTrace(rid) {
   try { return await liquidsoapCommand(`request.trace ${rid}`, 3000); } catch { return ''; }
 }
 
+async function liquidsoapRequestStatus(rid) {
+  const wanted = String(rid);
+  try {
+    // request.metadata contains track metadata, not the request lifecycle state.
+    // Liquidsoap exposes lifecycle membership through these dedicated lists.
+    const [onAirRaw, resolvingRaw, aliveRaw, queueRaw] = await Promise.all([
+      liquidsoapCommand('request.on_air', 3000),
+      liquidsoapCommand('request.resolving', 3000),
+      liquidsoapCommand('request.alive', 3000),
+      liquidsoapCommand('dj_queue.queue', 3000),
+    ]);
+    const onAir = requestIds(onAirRaw);
+    const resolving = requestIds(resolvingRaw);
+    const alive = requestIds(aliveRaw);
+    const queued = requestIds(queueRaw);
+    if (onAir.has(wanted)) return { status: 'playing' };
+    if (resolving.has(wanted)) return { status: 'resolving' };
+    if (queued.has(wanted)) return { status: 'ready' };
+    if (alive.has(wanted)) return { status: 'alive' };
+    return { status: 'destroyed' };
+  } catch (error) {
+    return { status: '', error };
+  }
+}
+
 async function waitForRequestState(rid, accepted, timeoutMs) {
   const wanted = new Set(accepted);
   const deadline = Date.now() + timeoutMs;
-  let last = { status: '', metadata: '' };
+  let last = { status: '' };
   while (Date.now() < deadline) {
     last = await liquidsoapRequestStatus(rid);
     if (wanted.has(last.status)) return last;
     if (last.status === 'destroyed') break;
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   }
   return last;
 }
 
 async function startProgrammeRequest(rid) {
-  // cross() may already have prepared an automatic song before this bulletin was
-  // inserted. One skip can therefore land on that prefetched song even though the
-  // bulletin is first in dj_queue. Confirm the bulletin RID actually reaches the
-  // playing state and, only when it has not, discard the prefetched hop as well.
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    await controllerRequest('/dj/skip', { method: 'POST' });
-    const state = await waitForRequestState(rid, ['playing', 'destroyed'], 3500);
-    if (state.status === 'playing') return attempt;
-    if (state.status === 'destroyed') {
-      const trace = await requestTrace(rid);
-      throw new Error(`The bulletin request was destroyed before playback.${trace ? ` ${trace.slice(-500)}` : ''}`);
-    }
-    await log(`Bulletin RID ${rid} was still ${state.status || 'pending'} after skip ${attempt}; clearing a prefetched music track.`);
-  }
+  // A single skip is enough to make the priority request.queue branch take over.
+  // Never issue repeated skips while polling: doing so can cut off the bulletin
+  // itself during the incoming crossfade.
+  await controllerRequest('/dj/skip', { method: 'POST' });
+  const state = await waitForRequestState(rid, ['playing', 'destroyed'], 20000);
+  if (state.status === 'playing') return 1;
   const trace = await requestTrace(rid);
-  throw new Error(`The bulletin was queued but never reached the air after three handover attempts.${trace ? ` ${trace.slice(-500)}` : ''}`);
+  if (state.status === 'destroyed') {
+    throw new Error(`The bulletin request was destroyed before playback.${trace ? ` ${trace.slice(-500)}` : ''}`);
+  }
+  throw new Error(`The bulletin remained ${state.status || 'unconfirmed'} after one safe handover attempt. No additional songs were skipped.${trace ? ` ${trace.slice(-500)}` : ''}`);
 }
 
 async function queueAsProgrammeItem(packagePath) {
@@ -1031,13 +1041,13 @@ async function queueAsProgrammeItem(packagePath) {
   }
 
   await log(`Bulletin audio queued in Liquidsoap as RID ${bulletinRid}; waiting for it to prepare.`);
-  const prepared = await waitForRequestState(bulletinRid, ['ready', 'playing', 'destroyed'], 12000);
+  const prepared = await waitForRequestState(bulletinRid, ['ready', 'playing', 'destroyed'], 15000);
   if (prepared.status === 'destroyed') {
     const trace = await requestTrace(bulletinRid);
     throw new Error(`The bulletin request failed while preparing.${trace ? ` ${trace.slice(-500)}` : ''}`);
   }
   if (!['ready', 'playing'].includes(prepared.status)) {
-    await log(`Bulletin RID ${bulletinRid} remained ${prepared.status || 'pending'}; beginning the handover so Liquidsoap resolves it on demand.`);
+    await log(`Bulletin RID ${bulletinRid} remained ${prepared.status || 'unconfirmed'}; beginning one safe handover attempt.`);
   }
 
   const skipCount = prepared.status === 'playing' ? 0 : await startProgrammeRequest(bulletinRid);
@@ -1275,7 +1285,9 @@ function updaterContainer(command) {
     '-w', EXTENSION_DIR,
     '-e', `EXTENSION_DIR=${EXTENSION_DIR}`,
     '-e', `SUBWAVE_DIR=${SUBWAVE_DIR}`,
-    '-e', 'SUBWAVE_STATE_DIR=/var/sub-wave',
+    '-e', `SUBWAVE_STATE_DIR=${HOST_STATE_DIR}`,
+    // DATA_DIR is the path inside this updater container; the Compose bind source
+    // above still uses the real host path through SUBWAVE_STATE_DIR.
     '-e', 'DATA_DIR=/var/sub-wave/extensions/hourly-news',
     '-e', `SUBWAVE_NETWORK=${SUBWAVE_NETWORK}`,
     '-e', `MANAGER_PORT=${MANAGER_PORT}`,
