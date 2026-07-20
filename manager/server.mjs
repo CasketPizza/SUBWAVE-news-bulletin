@@ -1188,9 +1188,10 @@ async function waitForRequestResolution(rid, timeoutMs = 15000) {
   return { resolved: false, trace, failure: 'resolution was not confirmed before timeout' };
 }
 
-async function waitForPreparedBulletinChild(rootRid, packagePath, timeoutMs = 15000) {
+async function waitForPreparedBulletinRequest(rootRid, packagePath, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   let lastIds = [];
+  let lastQueueIds = [];
   while (Date.now() < deadline) {
     try {
       const [allRaw, aliveRaw, queueRaw, resolvingRaw] = await Promise.all([
@@ -1199,29 +1200,44 @@ async function waitForPreparedBulletinChild(rootRid, packagePath, timeoutMs = 15
         liquidsoapCommand('dj_queue.queue', 3000),
         liquidsoapCommand('request.resolving', 3000),
       ]);
-      const resolving = new Set(requestIds(resolvingRaw));
+      const resolving = new Set(requestIds(resolvingRaw).map(String));
+      const queueIds = requestIds(queueRaw).map(String);
+      const queued = new Set(queueIds);
+      // Important: on the Liquidsoap build used by SUB/WAVE, an annotate: URI
+      // often keeps the SAME RID after resolution and preparation. v0.5.7
+      // incorrectly filtered rootRid out while waiting for a separate child RID.
       const ids = Array.from(new Set([
-        ...requestIds(queueRaw),
-        ...requestIds(aliveRaw),
-        ...requestIds(allRaw),
-      ])).filter((rid) => rid !== String(rootRid));
+        String(rootRid),
+        ...queueIds,
+        ...requestIds(aliveRaw).map(String),
+        ...requestIds(allRaw).map(String),
+      ]));
       lastIds = ids;
+      lastQueueIds = queueIds;
       for (const rid of ids) {
         let metadata = '';
         try { metadata = await liquidsoapCommand(`request.metadata ${rid}`, 3000); } catch { continue; }
         const filename = metadataValue(metadata, 'filename');
         const initialUri = metadataValue(metadata, 'initial_uri');
         const title = metadataValue(metadata, 'title');
-        const matchesPath = filename === packagePath || initialUri === packagePath || initialUri.includes(packagePath);
-        const matchesTitle = title === 'Hourly News Bulletin' && (filename === packagePath || initialUri.includes(packagePath));
-        if ((matchesPath || matchesTitle) && !resolving.has(String(rid))) {
-          return { rid: String(rid), metadata };
+        const rawMetadata = String(metadata || '');
+        const matchesPath = (
+          filename === packagePath
+          || initialUri === packagePath
+          || initialUri.includes(packagePath)
+          || rawMetadata.includes(packagePath)
+        );
+        const matchesBulletin = matchesPath && (!title || title === 'Hourly News Bulletin');
+        if (matchesBulletin && queued.has(String(rid)) && !resolving.has(String(rid))) {
+          return { rid: String(rid), metadata, reusedResolverRid: String(rid) === String(rootRid) };
         }
       }
     } catch {}
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   }
-  throw new Error(`Liquidsoap resolved the bulletin URI but did not expose a prepared child request before timeout${lastIds.length ? ` (visible RIDs: ${lastIds.join(', ')})` : ''}.`);
+  const visible = lastIds.length ? ` visible RIDs: ${lastIds.join(', ')}` : ' no visible RIDs';
+  const queued = lastQueueIds.length ? `; dj_queue RIDs: ${lastQueueIds.join(', ')}` : '; dj_queue was empty';
+  throw new Error(`Liquidsoap resolved the bulletin URI but did not expose the prepared bulletin request before timeout (${visible}${queued}).`);
 }
 
 async function waitForBulletinNowPlaying(notBeforeMs, timeoutMs = 20000) {
@@ -1262,14 +1278,12 @@ async function queueAsProgrammeItem(packagePath) {
       throw new Error(`Liquidsoap could not resolve the bulletin request: ${resolution.failure}.${resolution.trace ? ` ${resolution.trace.slice(-500)}` : ''}`);
     }
 
-    // "Pushed [...]" only says the annotate/root resolver emitted a child URI.
-    // The request.queue feeder still needs a moment to create and prepare the
-    // playable child request. Skipping in that gap lets the already-prefetched
-    // automatic song win the handover. Wait for the exact package path to appear
-    // as a non-resolving child request before touching the current track.
-    const child = await waitForPreparedBulletinChild(bulletinRid, packagePath, 15000);
-    childRid = child.rid;
-    await log(`Bulletin resolver RID ${bulletinRid} prepared playable child RID ${childRid}.`);
+    // "Pushed [...]" only confirms URI resolution. Wait until the exact package
+    // is a non-resolving item in dj_queue. Depending on Liquidsoap, this can be
+    // the SAME RID as the annotate/root request or a newly created RID.
+    const prepared = await waitForPreparedBulletinRequest(bulletinRid, packagePath, 15000);
+    childRid = prepared.rid;
+    await log(`Bulletin resolver RID ${bulletinRid} is prepared in dj_queue as playable RID ${childRid}${prepared.reusedResolverRid ? ' (same RID)' : ''}.`);
 
     // Restore the operator's pending queue only after the bulletin child is
     // definitely first and ready. This preserves pending order behind it.
@@ -1281,7 +1295,7 @@ async function queueAsProgrammeItem(packagePath) {
     const skipAt = Date.now();
     await controllerRequest('/dj/skip', { method: 'POST' });
     await waitForBulletinNowPlaying(skipAt, 20000);
-    await log(`Bulletin child RID ${childRid} confirmed on air after one safe handover skip.`);
+    await log(`Bulletin playable RID ${childRid} confirmed on air after one safe handover skip.`);
     return { movedPending: pending.length, bulletinRid, childRid, skipCount: 1 };
   } catch (error) {
     for (const uri of pending.slice(restored)) {

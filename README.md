@@ -1,5 +1,16 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.8 fixes
+
+- Fixes the v0.5.7 prepared-request detector incorrectly excluding the resolver
+  RID from inspection. On this Liquidsoap build, the `annotate:` request keeps
+  the same RID when it becomes the prepared `dj_queue` item; there is not always
+  a separate child RID.
+- Inspects the resolver RID together with every visible request, requires the
+  exact `news-package-*.wav` to be present in `dj_queue` and no longer resolving,
+  then sends one handover skip and confirms `now-playing.json`.
+- Keeps the modification-time cleanup fix and thought-process filtering.
+
 ## v0.5.7 fixes
 
 - Fixes the final programme-handover race: a resolver trace ending in `Pushed`
