@@ -1,5 +1,16 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.7 fixes
+
+- Fixes the final programme-handover race: a resolver trace ending in `Pushed`
+  does not yet mean the playable child request is ready inside `dj_queue`.
+- Waits for a non-resolving child request whose metadata points to the exact new
+  `news-package-*.wav`, then restores pending songs behind it and sends one skip.
+- Confirms the shared `now-playing.json` changed to `Hourly News Bulletin` before
+  reporting success. It never sends a second skip when confirmation fails.
+- Keeps the v0.5.6 modification-time cleanup fix and v0.5.5 thought-process
+  filtering.
+
 ## v0.5.6 fixes
 
 - Fixes a generated-audio cleanup race that could delete the just-created
