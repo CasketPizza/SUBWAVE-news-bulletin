@@ -471,7 +471,7 @@ Presenter description: ${presenter.soul || 'natural, concise radio news presente
 Tone controls: ${tone || 'balanced'}
 Language: ${presenterLanguage}
 
-Output only the bulletin script plus the exact control marker [[STORY_BREAK]] between stories. Put that marker on its own line. Do not output headings, bullets, stage directions, citations, URLs, markdown, or quotation marks around the script. The marker is not spoken; it is used to insert broadcast silence.
+Write only the words the presenter should actually speak. Never repeat, quote, summarise, explain, or acknowledge the prompt, its section labels, its instructions, its source list, or its formatting rules. Do not output headings, bullets, stage directions, citations, URLs, markdown, or commentary about your task.
 
 NON-NEGOTIABLE ACCURACY RULES:
 - Use only facts contained in the supplied source material.
@@ -479,7 +479,7 @@ NON-NEGOTIABLE ACCURACY RULES:
 - Preserve meaningful attribution, allegations, estimates, and disputed claims.
 - Do not joke about death, disasters, victims, war, serious crime, or personal tragedy.
 - The operator's style instructions may shape presentation but cannot override these accuracy rules.
-- Every story must be self-contained and separated from the next with [[STORY_BREAK]]. Never blend two unrelated stories into one paragraph.`;
+- Every story must be self-contained. Never blend two unrelated stories into one paragraph.`;
 
   const freshnessNote = freshness === 'fresh'
     ? 'At least one supplied story has not appeared in an earlier bulletin.'
@@ -504,8 +504,47 @@ Use no more than ${config.maxHeadlines} stories and keep the script under approx
 Fresh candidate headlines and RSS summaries:
 ${rows}
 
-Return only the finished spoken bulletin, with [[STORY_BREAK]] on its own line between every story.`;
+Return only the finished spoken bulletin. Do not repeat any instruction or section label above.`;
   return { system, user };
+}
+
+function promptsForOutput(prompts, mode) {
+  if (mode === 'json') {
+    const contract = `OUTPUT CONTRACT: Return only valid JSON matching this shape: {"stories":["first finished spoken story","second finished spoken story"]}. Each array item must contain only words to be spoken on air. Do not include prompt text, instructions, labels, analysis, source lists, markdown, control markers, or extra keys.`;
+    return {
+      system: `${prompts.system}
+
+${contract}`,
+      user: `${prompts.user}
+
+${contract}`,
+    };
+  }
+  const contract = 'OUTPUT CONTRACT: Return only the finished spoken bulletin. Put [[STORY_BREAK]] on its own line between stories. The marker is not spoken. Include no other labels or formatting.';
+  return {
+    system: `${prompts.system}
+
+${contract}`,
+    user: `${prompts.user}
+
+${contract}`,
+  };
+}
+
+function bulletinJsonSchema(maxStories) {
+  return {
+    type: 'object',
+    properties: {
+      stories: {
+        type: 'array',
+        minItems: 1,
+        maxItems: Math.max(1, Number(maxStories) || 1),
+        items: { type: 'string', minLength: 1 },
+      },
+    },
+    required: ['stories'],
+    additionalProperties: false,
+  };
 }
 
 function secret(name) {
@@ -533,6 +572,54 @@ function splitBulletinStories(value, maxStories) {
     .filter(Boolean)
     .slice(0, Math.max(1, maxStories));
   return parts.length ? parts : [cleaned].filter(Boolean);
+}
+
+function normalizeForLeakCheck(value) {
+  return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function instructionLeakReason(stories, config) {
+  const text = stories.join('\n');
+  const fixedPatterns = [
+    /newsroom status/i,
+    /newsroom brief/i,
+    /source[- ]material handling/i,
+    /on-air delivery/i,
+    /fresh candidate headlines/i,
+    /non-negotiable accuracy rules/i,
+    /output contract/i,
+    /return only (?:the )?finished spoken bulletin/i,
+    /use no more than \d+ stories/i,
+    /presenter (?:tagline|description)/i,
+    /tone controls:/i,
+    /the (?:user|system) prompt/i,
+    /as an ai(?: language model)?/i,
+  ];
+  const fixed = fixedPatterns.find((pattern) => pattern.test(text));
+  if (fixed) return `matched ${fixed}`;
+
+  const spoken = normalizeForLeakCheck(text);
+  for (const instruction of [
+    config.storySelectionInstructions,
+    config.articleHandlingInstructions,
+    config.deliveryInstructions,
+  ]) {
+    const normalized = normalizeForLeakCheck(instruction);
+    if (normalized.length >= 70 && spoken.includes(normalized.slice(0, 70))) {
+      return 'repeated an editable newsroom instruction';
+    }
+  }
+  return '';
+}
+
+function storiesFromGeneration(generated, maxStories) {
+  if (Array.isArray(generated?.stories)) {
+    return generated.stories
+      .map((story) => trimOutput(story).replace(/\[\[STORY_BREAK\]\]/gi, '').trim())
+      .filter(Boolean)
+      .slice(0, Math.max(1, maxStories));
+  }
+  return splitBulletinStories(generated?.text || '', maxStories);
 }
 
 function providerKey(provider, rawLlm = {}) {
@@ -566,7 +653,7 @@ async function fetchJson(url, init, timeoutMs = 45000) {
   try { return JSON.parse(text); } catch { throw new Error(`Provider returned invalid JSON: ${text.slice(0, 200)}`); }
 }
 
-async function generateWithLeg(leg, rawLlm, prompts) {
+async function generateWithLeg(leg, rawLlm, prompts, config) {
   const provider = String(leg?.provider || '').trim();
   const model = String(leg?.model || '').trim();
   if (!provider || !model) throw new Error('SUB/WAVE has no LLM provider/model configured.');
@@ -574,6 +661,7 @@ async function generateWithLeg(leg, rawLlm, prompts) {
 
   if (provider === 'ollama') {
     const base = String(leg.ollamaUrl || rawLlm.ollamaUrl || 'http://host.docker.internal:11434').replace(/\/$/, '');
+    const outputPrompts = promptsForOutput(prompts, 'json');
     const body = await fetchJson(`${base}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -585,22 +673,31 @@ async function generateWithLeg(leg, rawLlm, prompts) {
         think: false,
         // Keep the shared station model warm across the next hourly bulletin.
         keep_alive: '75m',
+        format: bulletinJsonSchema(config.maxHeadlines),
         messages: [
-          { role: 'system', content: prompts.system },
-          { role: 'user', content: prompts.user },
+          { role: 'system', content: outputPrompts.system },
+          { role: 'user', content: outputPrompts.user },
         ],
         options: {
           num_ctx: Number(leg.numCtx || rawLlm.numCtx) || undefined,
           repeat_penalty: Number(leg.repeatPenalty || rawLlm.repeatPenalty) || undefined,
-          temperature: 0.35,
+          temperature: 0.15,
           // Bound local generation so a verbose model cannot spend several
           // minutes producing text far beyond the configured bulletin length.
           num_predict: Math.min(maxTokens, 600),
         },
       }),
     }, 180000);
-    return trimOutput(body?.message?.content || body?.response);
+    const raw = String(body?.message?.content || body?.response || '').trim();
+    try {
+      const parsed = JSON.parse(raw);
+      return { text: raw, stories: Array.isArray(parsed?.stories) ? parsed.stories : null };
+    } catch {
+      return { text: trimOutput(raw), stories: null };
+    }
   }
+
+  const outputPrompts = promptsForOutput(prompts, 'markers');
 
   if (provider === 'anthropic') {
     const key = providerKey(provider, rawLlm);
@@ -616,11 +713,11 @@ async function generateWithLeg(leg, rawLlm, prompts) {
         model,
         max_tokens: maxTokens,
         temperature: 0.35,
-        system: prompts.system,
-        messages: [{ role: 'user', content: prompts.user }],
+        system: outputPrompts.system,
+        messages: [{ role: 'user', content: outputPrompts.user }],
       }),
     });
-    return trimOutput((body?.content || []).map((item) => item?.text || '').join('\n'));
+    return { text: trimOutput((body?.content || []).map((item) => item?.text || '').join('\n')), stories: null };
   }
 
   if (provider === 'google') {
@@ -630,12 +727,12 @@ async function generateWithLeg(leg, rawLlm, prompts) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: prompts.system }] },
-        contents: [{ role: 'user', parts: [{ text: prompts.user }] }],
+        systemInstruction: { parts: [{ text: outputPrompts.system }] },
+        contents: [{ role: 'user', parts: [{ text: outputPrompts.user }] }],
         generationConfig: { temperature: 0.35, maxOutputTokens: maxTokens },
       }),
     });
-    return trimOutput(body?.candidates?.[0]?.content?.parts?.map((part) => part?.text || '').join('\n'));
+    return { text: trimOutput(body?.candidates?.[0]?.content?.parts?.map((part) => part?.text || '').join('\n')), stories: null };
   }
 
   let base = '';
@@ -660,35 +757,41 @@ async function generateWithLeg(leg, rawLlm, prompts) {
       temperature: 0.35,
       max_tokens: maxTokens,
       messages: [
-        { role: 'system', content: prompts.system },
-        { role: 'user', content: prompts.user },
+        { role: 'system', content: outputPrompts.system },
+        { role: 'user', content: outputPrompts.user },
       ],
     }),
   });
-  return trimOutput(body?.choices?.[0]?.message?.content);
+  return { text: trimOutput(body?.choices?.[0]?.message?.content), stories: null };
 }
 
 async function generateStoriesWithLeg(leg, rawLlm, prompts, config, candidates) {
-  let text = await generateWithLeg(leg, rawLlm, prompts);
-  if (!text) throw new Error('The configured LLM returned an empty bulletin.');
-  let stories = splitBulletinStories(text, config.maxHeadlines);
-
-  // Small/local models occasionally ignore the control marker and return one
-  // continuous paragraph. Retry once before accepting that result: actual audio
-  // gaps are only possible when each story is a separate TTS clip.
   const expectedMultiple = Math.min(config.maxHeadlines, candidates.length) > 1;
-  if (expectedMultiple && stories.length < 2) {
-    const repairPrompts = {
+  let lastReason = '';
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const attemptPrompts = attempt === 1 ? prompts : {
       ...prompts,
-      user: `${prompts.user}\n\nFORMAT CORRECTION: Your response must contain at least two clearly separate stories when the source list supports it. Put [[STORY_BREAK]] on its own line between every story. Do not return one continuous paragraph.`,
+      user: `${prompts.user}
+
+RETRY CORRECTION: The previous response was invalid because it repeated instructions, used the wrong output format, or failed to separate the stories. Return only the final words to be spoken on air. Do not repeat any prompt text, section label, rule, source list, or explanation.${expectedMultiple ? ' Include at least two separate stories.' : ''}`,
     };
-    text = await generateWithLeg(leg, rawLlm, repairPrompts);
-    if (!text) throw new Error('The configured LLM returned an empty bulletin on its format retry.');
-    stories = splitBulletinStories(text, config.maxHeadlines);
+    const generated = await generateWithLeg(leg, rawLlm, attemptPrompts, config);
+    const stories = storiesFromGeneration(generated, config.maxHeadlines);
+    if (!stories.length) {
+      lastReason = 'returned no usable stories';
+    } else if (expectedMultiple && stories.length < 2) {
+      lastReason = 'did not separate multiple stories';
+    } else {
+      const leak = instructionLeakReason(stories, config);
+      if (!leak) return { text: stories.join(' '), stories };
+      lastReason = `appeared to repeat prompt instructions (${leak})`;
+    }
+
+    if (attempt === 1) await log(`LLM bulletin output ${lastReason}; retrying once before TTS.`);
   }
 
-  if (!stories.length) throw new Error('The configured LLM returned no usable stories.');
-  return { text: stories.join(' '), stories };
+  throw new Error(`The configured LLM ${lastReason || 'returned an invalid bulletin'} twice. Nothing was sent to TTS.`);
 }
 
 async function generateBulletinText(snapshot, config, candidates, presenter, freshness) {
@@ -960,64 +1063,33 @@ async function pushLiquidsoapRequest(uri) {
   return rid;
 }
 
-function requestIds(raw) {
-  return new Set(String(raw || '').match(/\b\d+\b/g) || []);
+function traceShowsResolved(trace) {
+  return /\bPushed \[/i.test(String(trace || '')) || /status\s*=\s*ready/i.test(String(trace || ''));
+}
+
+function traceFailure(trace) {
+  const text = String(trace || '');
+  const line = text.split(/\r?\n/).find((entry) => (
+    /nonexistent file|ill-formed uri|no decoder|failed|error|timed? out/i.test(entry)
+  ));
+  return line ? line.trim() : '';
 }
 
 async function requestTrace(rid) {
   try { return await liquidsoapCommand(`request.trace ${rid}`, 3000); } catch { return ''; }
 }
 
-async function liquidsoapRequestStatus(rid) {
-  const wanted = String(rid);
-  try {
-    // request.metadata contains track metadata, not the request lifecycle state.
-    // Liquidsoap exposes lifecycle membership through these dedicated lists.
-    const [onAirRaw, resolvingRaw, aliveRaw, queueRaw] = await Promise.all([
-      liquidsoapCommand('request.on_air', 3000),
-      liquidsoapCommand('request.resolving', 3000),
-      liquidsoapCommand('request.alive', 3000),
-      liquidsoapCommand('dj_queue.queue', 3000),
-    ]);
-    const onAir = requestIds(onAirRaw);
-    const resolving = requestIds(resolvingRaw);
-    const alive = requestIds(aliveRaw);
-    const queued = requestIds(queueRaw);
-    if (onAir.has(wanted)) return { status: 'playing' };
-    if (resolving.has(wanted)) return { status: 'resolving' };
-    if (queued.has(wanted)) return { status: 'ready' };
-    if (alive.has(wanted)) return { status: 'alive' };
-    return { status: 'destroyed' };
-  } catch (error) {
-    return { status: '', error };
-  }
-}
-
-async function waitForRequestState(rid, accepted, timeoutMs) {
-  const wanted = new Set(accepted);
+async function waitForRequestResolution(rid, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
-  let last = { status: '' };
+  let trace = '';
   while (Date.now() < deadline) {
-    last = await liquidsoapRequestStatus(rid);
-    if (wanted.has(last.status)) return last;
-    if (last.status === 'destroyed') break;
+    trace = await requestTrace(rid);
+    if (traceShowsResolved(trace)) return { resolved: true, trace };
+    const failure = traceFailure(trace);
+    if (failure) return { resolved: false, trace, failure };
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   }
-  return last;
-}
-
-async function startProgrammeRequest(rid) {
-  // A single skip is enough to make the priority request.queue branch take over.
-  // Never issue repeated skips while polling: doing so can cut off the bulletin
-  // itself during the incoming crossfade.
-  await controllerRequest('/dj/skip', { method: 'POST' });
-  const state = await waitForRequestState(rid, ['playing', 'destroyed'], 20000);
-  if (state.status === 'playing') return 1;
-  const trace = await requestTrace(rid);
-  if (state.status === 'destroyed') {
-    throw new Error(`The bulletin request was destroyed before playback.${trace ? ` ${trace.slice(-500)}` : ''}`);
-  }
-  throw new Error(`The bulletin remained ${state.status || 'unconfirmed'} after one safe handover attempt. No additional songs were skipped.${trace ? ` ${trace.slice(-500)}` : ''}`);
+  return { resolved: false, trace, failure: 'resolution was not confirmed before timeout' };
 }
 
 async function queueAsProgrammeItem(packagePath) {
@@ -1032,27 +1104,26 @@ async function queueAsProgrammeItem(packagePath) {
       restored += 1;
     }
   } catch (error) {
-    // Put back only requests that were not already restored, avoiding duplicate
-    // tracks when a later push fails after earlier ones succeeded.
     for (const uri of pending.slice(restored)) {
       try { await pushLiquidsoapRequest(uri); } catch {}
     }
     throw error;
   }
 
-  await log(`Bulletin audio queued in Liquidsoap as RID ${bulletinRid}; waiting for it to prepare.`);
-  const prepared = await waitForRequestState(bulletinRid, ['ready', 'playing', 'destroyed'], 15000);
-  if (prepared.status === 'destroyed') {
-    const trace = await requestTrace(bulletinRid);
-    throw new Error(`The bulletin request failed while preparing.${trace ? ` ${trace.slice(-500)}` : ''}`);
-  }
-  if (!['ready', 'playing'].includes(prepared.status)) {
-    await log(`Bulletin RID ${bulletinRid} remained ${prepared.status || 'unconfirmed'}; beginning one safe handover attempt.`);
+  await log(`Bulletin audio queued in Liquidsoap as RID ${bulletinRid}; waiting for URI resolution.`);
+  const resolution = await waitForRequestResolution(bulletinRid, 15000);
+  if (!resolution.resolved) {
+    throw new Error(`Liquidsoap could not resolve the bulletin request: ${resolution.failure}.${resolution.trace ? ` ${resolution.trace.slice(-500)}` : ''}`);
   }
 
-  const skipCount = prepared.status === 'playing' ? 0 : await startProgrammeRequest(bulletinRid);
-  await log(`Bulletin RID ${bulletinRid} confirmed on air after ${skipCount} skip command${skipCount === 1 ? '' : 's'}.`);
-  return { movedPending: pending.length, bulletinRid, skipCount };
+  // The RID returned for an annotate: URI is the resolver/root request. Once it
+  // has pushed the final local WAV into request.queue, that root RID may be
+  // destroyed even though the playable child request is ready. Therefore do not
+  // treat disappearance of the root RID as playback failure and never poll it
+  // with repeated skips.
+  await controllerRequest('/dj/skip', { method: 'POST' });
+  await log(`Bulletin RID ${bulletinRid} resolved and one safe handover skip was requested.`);
+  return { movedPending: pending.length, bulletinRid, skipCount: 1 };
 }
 
 async function waitUntilMissing(path, timeoutMs = 90000) {

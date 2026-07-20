@@ -1,11 +1,15 @@
 # SUB/WAVE Hourly News Bulletin
 
 
-## v0.5.3 fixes
+## v0.5.4 fixes
 
-- Uses Liquidsoap's dedicated request lifecycle lists instead of trying to read a nonexistent `status=` field from `request.metadata`.
-- Performs only one safe skip for an immediate bulletin handover, preventing the bulletin itself and following songs from being skipped while status is checked.
-- Re-detects SUB/WAVE's real host-side state mount during update, restart, and rollback so `/var/sub-wave` cannot be mistakenly saved as a host bind path.
+- Treats Liquidsoap's `annotate:` RID as a resolver request: a trace ending in
+  `Pushed [...]` is success even when the root RID is then destroyed.
+- Waits for successful URI resolution, performs exactly one handover skip, and
+  no longer reports a playing bulletin as "destroyed before playback".
+- Uses Ollama structured JSON output for the story array, validates every story
+  before TTS, retries once when the model repeats prompt instructions, and
+  refuses to synthesize a contaminated response after the retry.
 
 A standalone companion for [SUB/WAVE](https://github.com/perminder-klair/subwave).
 It adds an hourly multi-source news bulletin without patching, rebuilding, or
