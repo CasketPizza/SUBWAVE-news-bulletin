@@ -3,7 +3,7 @@ import multer from 'multer';
 import { XMLParser } from 'fast-xml-parser';
 import { createHash } from 'node:crypto';
 import {
-  mkdir, readFile, writeFile, rename, rm, readdir, copyFile,
+  mkdir, readFile, writeFile, rename, rm, readdir, copyFile, stat,
 } from 'node:fs/promises';
 import fs, { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -1293,11 +1293,22 @@ async function runBulletin(reason = 'manual') {
   } finally {
     runBusy = false;
     try {
-      const names = (await readdir(GENERATED_DIR))
-        .filter((name) => /\.(wav|mp3)$/i.test(name))
-        .sort()
-        .reverse();
-      await Promise.all(names.slice(24).map((name) => rm(join(GENERATED_DIR, name), { force: true })));
+      // Keep the newest generated audio by modification time, not by filename.
+      // Different prefixes (story-, silence-, narration-, news-package-) do not
+      // sort chronologically. The old lexical cleanup could delete the brand-new
+      // news-package immediately after queueing it, before Liquidsoap opened the
+      // resolved child request, producing a "Nonexistent file" race on air.
+      const generated = await Promise.all(
+        (await readdir(GENERATED_DIR))
+          .filter((name) => /\.(wav|mp3)$/i.test(name))
+          .map(async (name) => {
+            const path = join(GENERATED_DIR, name);
+            const info = await stat(path);
+            return { path, mtimeMs: info.mtimeMs };
+          }),
+      );
+      generated.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      await Promise.all(generated.slice(24).map((item) => rm(item.path, { force: true })));
     } catch {}
   }
 }

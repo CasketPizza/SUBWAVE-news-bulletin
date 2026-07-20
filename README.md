@@ -1,5 +1,14 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.6 fixes
+
+- Fixes a generated-audio cleanup race that could delete the just-created
+  `news-package-*.wav` immediately after it was queued but before Liquidsoap
+  opened the resolved child request.
+- Sorts generated audio by filesystem modification time instead of filename.
+  Mixed prefixes such as `story-`, `silence-`, `narration-`, and
+  `news-package-` are therefore retained in true newest-first order.
+- Keeps the v0.5.5 thought-process filtering and structured-output safeguards.
 
 ## v0.5.5 fixes
 
