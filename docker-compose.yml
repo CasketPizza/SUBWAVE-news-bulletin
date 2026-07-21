@@ -5,6 +5,16 @@ services:
       context: ./manager
     container_name: subwave-news-bulletin
     restart: unless-stopped
+    init: true
+    cpus: "1.50"
+    mem_limit: 768m
+    pids_limit: 128
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     expose:
       - "7711"
     env_file:
@@ -23,6 +33,11 @@ services:
       LIQUIDSOAP_PORT: "1234"
       TZ: "${TZ:-Australia/Sydney}"
       GITHUB_REPO: "CasketPizza/SUBWAVE-news-bulletin"
+      LOG_MAX_BYTES: "131072"
+      LOG_TAIL_BYTES: "65536"
+      LOG_MAX_LINES: "120"
+      FFMPEG_TIMEOUT_MS: "180000"
+      FFPROBE_TIMEOUT_MS: "30000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "${EXTENSION_DIR}:${EXTENSION_DIR}"

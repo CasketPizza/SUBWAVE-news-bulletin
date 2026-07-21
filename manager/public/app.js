@@ -5,6 +5,8 @@ let options = {};
 let instructionDefaults = {};
 let noticeTimer = null;
 let logRefreshTimer = null;
+let logRequestInFlight = false;
+let statusRequestPromise = null;
 
 // The manager is normally reverse-proxied below /news-bulletin/. Resolve every
 // request relative to the page so the same build also works directly at /.
@@ -166,7 +168,7 @@ async function load() {
   const selected = document.querySelector(`input[name=scheduleMode][value="${model.scheduleMode}"]`);
   if (selected) selected.checked = true;
   updateAssetStates();
-  await Promise.all([loadStatus(), loadLogs()]);
+  await loadStatus();
 }
 
 function collect() {
@@ -277,7 +279,26 @@ function previewAsset(type) {
 }
 
 async function loadStatus(forceUpdateCheck = false) {
-  const status = await api(`/api/status${forceUpdateCheck ? '?refresh=1' : ''}`);
+  if (statusRequestPromise) {
+    if (!forceUpdateCheck) {
+      const status = await statusRequestPromise;
+      return renderStatus(status);
+    }
+    try { await statusRequestPromise; } catch {}
+  }
+
+  const request = api(`/api/status${forceUpdateCheck ? '?refresh=1' : ''}`);
+  statusRequestPromise = request;
+  let status;
+  try {
+    status = await request;
+  } finally {
+    if (statusRequestPromise === request) statusRequestPromise = null;
+  }
+  return renderStatus(status);
+}
+
+function renderStatus(status) {
   $('managerStatus').textContent = status.busy ? 'Preparing bulletin…' : 'Running';
   $('versionStatus').textContent = status.updateAvailable
     ? `${status.version}${status.latestVersion ? ` → ${status.latestVersion}` : ''} — update available`
@@ -300,23 +321,30 @@ async function loadStatus(forceUpdateCheck = false) {
 }
 
 async function loadLogs() {
+  if (logRequestInFlight) return;
+  logRequestInFlight = true;
   const panel = $('logs');
   const previousScrollTop = panel.scrollTop;
   const nearBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 32;
-  const text = await api('/api/logs');
-  if (panel.textContent === text) return;
-  panel.textContent = text;
-  if (nearBottom || panel.dataset.loaded !== '1') panel.scrollTop = panel.scrollHeight;
-  else panel.scrollTop = previousScrollTop;
-  panel.dataset.loaded = '1';
+  try {
+    const text = await api('/api/logs');
+    const display = text || 'No recent actions.';
+    if (panel.textContent === display) return;
+    panel.textContent = display;
+    if (nearBottom || panel.dataset.loaded !== '1') panel.scrollTop = panel.scrollHeight;
+    else panel.scrollTop = previousScrollTop;
+    panel.dataset.loaded = '1';
+  } finally {
+    logRequestInFlight = false;
+  }
 }
 
 function setLogAutoRefresh() {
   clearInterval(logRefreshTimer);
   logRefreshTimer = null;
-  if (document.visibilityState !== 'visible') return;
+  if (!$('liveLogs').checked || document.visibilityState !== 'visible') return;
   loadLogs().catch(() => {});
-  logRefreshTimer = setInterval(() => loadLogs().catch(() => {}), 2000);
+  logRefreshTimer = setInterval(() => loadLogs().catch(() => {}), 5000);
 }
 
 async function command(path, message) {
@@ -386,6 +414,20 @@ $('updateNow').onclick = () => command('/api/update', 'Update started.').catch((
 $('rollback').onclick = () => command('/api/rollback', 'Rollback started.').catch((error) => notice(error.message, true));
 $('refreshProxy').onclick = () => command('/api/proxy/refresh', 'SUB/WAVE path refreshed.').catch((error) => notice(error.message, true));
 $('refreshLogs').onclick = () => loadLogs().catch((error) => notice(error.message, true));
+$('clearLogs').onclick = async () => {
+  try {
+    const result = await api('/api/logs', { method: 'DELETE' });
+    $('logs').textContent = 'No recent actions.';
+    $('logs').dataset.loaded = '1';
+    notice(result.message || 'Recent actions cleared.');
+  } catch (error) {
+    notice(error.message, true);
+  }
+};
+$('liveLogs').onchange = () => {
+  setLogAutoRefresh();
+  if (!$('liveLogs').checked) notice('Live debugging paused.');
+};
 
 document.addEventListener('visibilitychange', setLogAutoRefresh);
 window.addEventListener('focus', setLogAutoRefresh);
@@ -393,4 +435,4 @@ window.addEventListener('focus', setLogAutoRefresh);
 load().then(setLogAutoRefresh).catch((error) => notice(error.message, true));
 setInterval(() => {
   if (document.visibilityState === 'visible') loadStatus().catch(() => {});
-}, 15000);
+}, 30000);

@@ -206,8 +206,18 @@
     </div>
 
     <section>
-      <div class="section-heading"><h2>Recent log</h2><button id="refreshLogs">Refresh</button></div>
-      <pre id="logs">Loading…</pre>
+      <div class="section-heading">
+        <div>
+          <h2>Recent actions</h2>
+          <p>Kept deliberately short. It does not refresh unless debugging is enabled.</p>
+        </div>
+        <div class="actions log-actions">
+          <button id="refreshLogs" type="button">Refresh once</button>
+          <button id="clearLogs" type="button">Clear</button>
+        </div>
+      </div>
+      <label class="toggle debug-toggle"><input id="liveLogs" type="checkbox"> Enable live debugging <small>(refresh every 5 seconds while this tab is visible)</small></label>
+      <pre id="logs">Debug log paused. Click Refresh once or enable live debugging.</pre>
     </section>
   </main>
   <script src="app.js"></script>

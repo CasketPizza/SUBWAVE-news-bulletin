@@ -1,5 +1,20 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.10 stability fixes
+
+- Keeps only a small recent-actions log: at most 120 lines from a capped 128 KiB file.
+- Reads only the tail of the log instead of loading the entire file into memory.
+- Disables live log polling by default; it runs every five seconds only while
+  **Enable live debugging** is checked and the page is visible.
+- Prevents overlapping log and status requests and slows ordinary status refreshes
+  to every 30 seconds.
+- Adds **Refresh once** and **Clear** controls for diagnostics.
+- Caps the companion at 1.5 CPU cores, 768 MiB RAM and 128 processes, and rotates
+  Docker's own container logs.
+- Gives FFmpeg and FFprobe hard timeouts so a stuck audio conversion cannot run
+  indefinitely. Updater helper containers also receive conservative limits.
+
+
 ## v0.5.9 fixes and interface improvements
 
 - Repairs update detection by marking the mounted checkout as a safe Git directory,

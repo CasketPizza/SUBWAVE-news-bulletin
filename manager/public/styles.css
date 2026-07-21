@@ -10,3 +10,5 @@ button:disabled{opacity:.55;cursor:wait}
 .save-row .primary{box-shadow:0 8px 28px rgba(237,39,211,.22)}
 @media(max-width:560px){main{padding-bottom:120px}.save-row{left:10px;right:10px;bottom:10px}.save-row .primary{width:100%}}
 main{padding-bottom:140px}
+
+.log-actions{margin-top:0;justify-content:flex-end}.debug-toggle{margin:16px 0 10px}.debug-toggle small{color:#9d91a6}.log-actions button{white-space:nowrap}

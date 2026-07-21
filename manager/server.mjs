@@ -38,6 +38,12 @@ const GITHUB_REPO = process.env.GITHUB_REPO || 'CasketPizza/SUBWAVE-news-bulleti
 const LIQUIDSOAP_HOST = process.env.LIQUIDSOAP_HOST || 'broadcast';
 const LIQUIDSOAP_PORT = Number(process.env.LIQUIDSOAP_PORT || 1234);
 
+const LOG_MAX_BYTES = Math.min(1024 * 1024, Math.max(32 * 1024, Number(process.env.LOG_MAX_BYTES) || 128 * 1024));
+const LOG_TAIL_BYTES = Math.min(LOG_MAX_BYTES, Math.max(16 * 1024, Number(process.env.LOG_TAIL_BYTES) || 64 * 1024));
+const LOG_MAX_LINES = Math.min(500, Math.max(25, Number(process.env.LOG_MAX_LINES) || 120));
+const FFMPEG_TIMEOUT_MS = Math.min(10 * 60 * 1000, Math.max(30 * 1000, Number(process.env.FFMPEG_TIMEOUT_MS) || 3 * 60 * 1000));
+const FFPROBE_TIMEOUT_MS = Math.min(2 * 60 * 1000, Math.max(5 * 1000, Number(process.env.FFPROBE_TIMEOUT_MS) || 30 * 1000));
+
 const DEFAULTS = {
   enabled: true,
   scheduleMode: 'after',
@@ -232,10 +238,46 @@ function cleanSettings(body) {
   };
 }
 
+let logMaintenance = Promise.resolve();
+
+async function readTail(path, maxBytes = LOG_TAIL_BYTES, maxLines = LOG_MAX_LINES) {
+  let handle;
+  try {
+    const info = await stat(path);
+    if (!info.size) return '';
+    const length = Math.min(info.size, maxBytes);
+    const start = Math.max(0, info.size - length);
+    handle = await fs.promises.open(path, 'r');
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    let text = buffer.subarray(0, bytesRead).toString('utf8');
+    if (start > 0) text = text.replace(/^[^\n]*(?:\n|$)/, '');
+    return text.split(/\r?\n/).filter(Boolean).slice(-maxLines).join('\n');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return '';
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function compactLogIfNeeded() {
+  try {
+    const info = await stat(LOG_FILE);
+    if (info.size <= LOG_MAX_BYTES) return;
+    const recent = await readTail(LOG_FILE, LOG_TAIL_BYTES, LOG_MAX_LINES);
+    await writeFile(LOG_FILE, recent ? `${recent}\n` : '');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') process.stderr.write(`Could not compact bulletin log: ${error.message}\n`);
+  }
+}
+
 async function log(message) {
   const line = `${new Date().toISOString()} ${message}\n`;
   process.stdout.write(line);
   await writeFile(LOG_FILE, line, { flag: 'a' }).catch(() => {});
+  logMaintenance = logMaintenance.then(compactLogIfNeeded, compactLogIfNeeded);
+  await logMaintenance;
 }
 
 function hash(value) {
@@ -1019,9 +1061,18 @@ async function makeNarrationAudio(config, speechPaths) {
 }
 
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', ...options });
+  const defaultTimeout = command === 'ffmpeg' ? FFMPEG_TIMEOUT_MS
+    : command === 'ffprobe' ? FFPROBE_TIMEOUT_MS
+      : undefined;
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+    ...(defaultTimeout ? { timeout: defaultTimeout, killSignal: 'SIGKILL' } : {}),
+    ...options,
+  });
+  if (result.error) throw new Error(`${command} failed: ${result.error.message}`);
   if (result.status !== 0) {
-    throw new Error(`${command} failed: ${(result.stderr || result.stdout || '').trim()}`);
+    throw new Error(`${command} failed: ${(result.stderr || result.stdout || `exit ${result.status}`).trim()}`);
   }
   return (result.stdout || '').trim();
 }
@@ -1594,6 +1645,7 @@ function updaterContainer(command) {
   try { checkoutOwner = fs.statSync(EXTENSION_DIR); } catch {}
   const args = [
     'run', '-d', '--rm', '--name', name,
+    '--memory', '512m', '--cpus', '1.0', '--pids-limit', '128',
     '-v', '/var/run/docker.sock:/var/run/docker.sock',
     '-v', `${EXTENSION_DIR}:${EXTENSION_DIR}`,
     '-v', `${SUBWAVE_DIR}:${SUBWAVE_DIR}`,
@@ -1609,6 +1661,7 @@ function updaterContainer(command) {
     '-e', `MANAGER_PORT=${MANAGER_PORT}`,
     '-e', `HOST_REPO_UID=${checkoutOwner.uid}`,
     '-e', `HOST_REPO_GID=${checkoutOwner.gid}`,
+    '-e', 'COMPOSE_PARALLEL_LIMIT=1',
     MANAGER_IMAGE,
     'bash', './manage.sh', command,
   ];
@@ -1785,11 +1838,19 @@ app.get('/api/status', async (req, res) => {
 
 app.get('/api/logs', async (_req, res) => {
   try {
-    const text = await readFile(LOG_FILE, 'utf8');
-    res.type('text/plain').send(text.split(/\r?\n/).slice(-100).join('\n'));
-  } catch {
-    res.type('text/plain').send('');
+    res.type('text/plain').send(await readTail(LOG_FILE));
+  } catch (error) {
+    res.status(500).type('text/plain').send(`Could not read recent actions: ${error.message}`);
   }
+});
+
+app.delete('/api/logs', async (_req, res) => {
+  logMaintenance = logMaintenance.then(
+    () => writeFile(LOG_FILE, ''),
+    () => writeFile(LOG_FILE, ''),
+  );
+  await logMaintenance;
+  res.json({ ok: true, message: 'Recent actions cleared.' });
 });
 
 app.post('/api/proxy/refresh', async (_req, res) => {
