@@ -29,6 +29,7 @@ const SEEN_FILE = join(DATA_DIR, 'seen.json');
 const HEADLINES_CACHE_FILE = join(DATA_DIR, 'headlines-cache.json');
 const INTEREST_ARTICLES_CACHE_FILE = join(DATA_DIR, 'interest-articles-cache.json');
 const INTERESTS_FILE = join(DATA_DIR, 'interests.json');
+const HELD_QUEUE_FILE = join(DATA_DIR, 'held-queue.json');
 const LOG_FILE = join(DATA_DIR, 'manager.log');
 const ASSET_META_FILE = join(DATA_DIR, 'assets.json');
 const SAY_FILE = join(STATE_DIR, 'say.txt');
@@ -1600,26 +1601,39 @@ async function makeBulletinAudio(config, voicePath) {
   return out;
 }
 
-async function makeFullPackage(bulletinPath) {
-  const parts = [];
+function protectedTailSeconds(crossfadeSeconds) {
+  const crossfade = Math.min(60, Math.max(0, Number(crossfadeSeconds) || 0));
+  // SUB/WAVE's custom liq_cross_duration annotation is retained, but some
+  // Liquidsoap request/metadata paths can lose that override. A real silent tail
+  // longer than the station crossfade makes the handoff safe even when the
+  // mixer falls back to its global crossfade: it can only consume silence, never
+  // the end of a spoken story.
+  return Math.max(12.5, crossfade + 2.5);
+}
+
+async function makeFullPackage(bulletinPath, crossfadeSeconds = 10) {
+  const programmeParts = [];
   const intro = join(ASSET_DIR, 'intro.wav');
   const outro = join(ASSET_DIR, 'outro.wav');
-  if (existsSync(intro)) parts.push(intro);
-  parts.push(bulletinPath);
-  if (existsSync(outro)) parts.push(outro);
+  if (existsSync(intro)) programmeParts.push(intro);
+  programmeParts.push(bulletinPath);
+  if (existsSync(outro)) programmeParts.push(outro);
 
-  // The bulletin itself now exits with a zero-duration Liquidsoap crossfade.
-  // Keep a short silent tail inside the programme item as decoder-safe padding;
-  // the following song cannot overlap or consume any spoken audio.
-  const tail = generatedPath('package-tail');
+  // Normalize every programme component before concat. Uploaded assets are
+  // normally already 44.1 kHz stereo PCM, but doing this here makes the final
+  // package independent of old assets created by earlier releases.
+  const parts = programmeParts.map((path, index) => normalizeAudio(path, `package-programme-${index + 1}`));
+  const contentDuration = parts.reduce((total, path) => total + durationOf(path), 0);
+  const tailSeconds = protectedTailSeconds(crossfadeSeconds);
+  const tail = generatedPath('package-protected-tail');
   run('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-    '-t', '0.65', '-c:a', 'pcm_s16le', tail,
+    '-t', tailSeconds.toFixed(3), '-c:a', 'pcm_s16le', tail,
   ]);
   parts.push(tail);
 
-  const expectedDuration = parts.reduce((total, path) => total + durationOf(path), 0);
+  const expectedDuration = contentDuration + tailSeconds;
   const out = generatedPath('news-package');
   const inputs = parts.flatMap((path) => ['-i', path]);
   const labels = parts.map((_, index) => `[${index}:a]`).join('');
@@ -1633,7 +1647,7 @@ async function makeFullPackage(bulletinPath) {
   if (duration + 0.15 < expectedDuration) {
     throw new Error(`Final bulletin package is incomplete (${duration.toFixed(2)}s rendered; expected at least ${expectedDuration.toFixed(2)}s).`);
   }
-  return { path: out, duration };
+  return { path: out, duration, contentDuration, protectedTailSeconds: tailSeconds };
 }
 
 function liquidsoapCommand(command, timeoutMs = 3500) {
@@ -1828,20 +1842,24 @@ async function waitForBulletinNowPlaying(notBeforeMs, timeoutMs = 20000) {
 let bulletinPlaybackUntilMs = 0;
 let bulletinPlaybackStartedAt = null;
 let bulletinPlaybackDurationSeconds = 0;
+let protectedHandoverTask = null;
+let heldQueueState = null;
 
 function bulletinPlaybackActive() {
-  return Date.now() < bulletinPlaybackUntilMs;
+  return Date.now() < bulletinPlaybackUntilMs || !!heldQueueState;
 }
 
-function armBulletinPlaybackGuard(startedAtMs, durationSeconds) {
+function armBulletinPlaybackGuard(startedAtMs, durationSeconds, safeRestoreAtMs) {
   const seconds = Math.max(1, Number(durationSeconds) || 1);
   bulletinPlaybackStartedAt = new Date(startedAtMs).toISOString();
   bulletinPlaybackDurationSeconds = seconds;
-  // Hold the companion's skip/run lock for the entire verified package plus a
-  // small decoder/metadata grace period. This does not stop normal EOF playout;
-  // it only prevents this companion from issuing another handover skip while
-  // the newscaster is still speaking.
-  bulletinPlaybackUntilMs = startedAtMs + Math.ceil(seconds * 1000) + 15000;
+  // The lock lasts until the queue handback is safe, not merely until metadata
+  // first says "Hourly News Bulletin". now-playing changes at crossfade start,
+  // before the incoming programme item has reached full level.
+  bulletinPlaybackUntilMs = Math.max(
+    startedAtMs + Math.ceil(seconds * 1000) + 15000,
+    Number(safeRestoreAtMs) || 0,
+  );
 }
 
 async function currentNowPlaying() {
@@ -1857,26 +1875,168 @@ function isNewsBulletinNowPlaying(value) {
     && String(value?.artist || '').trim() === 'SUB/WAVE News';
 }
 
-async function restorePendingQueue(pending) {
+async function restorePendingQueueDetailed(pending) {
   let restored = 0;
+  const failed = [];
   for (const uri of pending) {
     try {
       await pushLiquidsoapRequest(uri);
       restored += 1;
     } catch (error) {
+      failed.push(uri);
       await log(`Could not restore a pending song behind the bulletin: ${error.message}`);
     }
   }
+  return { restored, failed };
+}
+
+async function restorePendingQueue(pending) {
+  return (await restorePendingQueueDetailed(pending)).restored;
+}
+
+function mergeHeldUris(existing, incoming) {
+  const out = Array.isArray(existing) ? [...existing] : [];
+  const seen = new Set(out.map(String));
+  for (const uri of incoming || []) {
+    const value = String(uri || '').trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+async function saveHeldQueueState(state) {
+  heldQueueState = state;
+  await saveJson(HELD_QUEUE_FILE, state);
+}
+
+async function clearHeldQueueState() {
+  heldQueueState = null;
+  await rm(HELD_QUEUE_FILE, { force: true }).catch(() => {});
+}
+
+async function protectHandoverUntilSafeEnd(initialState) {
+  let state = initialState;
+  await saveHeldQueueState(state);
+  const excluded = new Set((state.excludedRids || []).map(String));
+  const safeRestoreAtMs = Number(state.safeRestoreAtMs) || Date.now();
+  const hardDeadlineMs = safeRestoreAtMs + 120000;
+  await log(`Protected bulletin handover armed until ${new Date(safeRestoreAtMs).toISOString()}. Pending songs remain completely outside dj_queue until the verified package, protected silent tail, and crossfade safety window have elapsed.`);
+
+  // SUB/WAVE may keep preloading tracks while the bulletin is on air. Drain any
+  // new pending requests throughout the whole package, not just at handover.
+  // This is intentionally a queue hold, never a skip.
+  while (Date.now() < safeRestoreAtMs) {
+    const appeared = await captureAndClearPendingQueue(excluded).catch(async (error) => {
+      await log(`Protected queue sweep warning: ${error.message}`);
+      return [];
+    });
+    if (appeared.length) {
+      const merged = mergeHeldUris(state.pending, appeared);
+      if (merged.length !== state.pending.length) {
+        state = { ...state, pending: merged, updatedAt: new Date().toISOString() };
+        await saveHeldQueueState(state);
+        await log(`Held ${appeared.length} additional queued song${appeared.length === 1 ? '' : 's'} while the bulletin remained protected.`);
+      }
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1000));
+  }
+
+  // At the expected end, wait for metadata to leave the bulletin as a final
+  // confirmation. The package already contains a crossfade-length silent tail,
+  // so this wait cannot consume speech. Never send an end skip.
+  while (Date.now() < hardDeadlineMs && isNewsBulletinNowPlaying(await currentNowPlaying())) {
+    const appeared = await captureAndClearPendingQueue(excluded).catch(() => []);
+    if (appeared.length) {
+      state = { ...state, pending: mergeHeldUris(state.pending, appeared), updatedAt: new Date().toISOString() };
+      await saveHeldQueueState(state);
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1000));
+  }
+
+  // One final sweep closes the tiny race between the last monitor tick and queue
+  // handback. auto_playlist can supply the first post-bulletin song while held
+  // requests are restored safely behind it.
+  const finalAppeared = await captureAndClearPendingQueue(excluded).catch(() => []);
+  state = { ...state, pending: mergeHeldUris(state.pending, finalAppeared) };
+  const totalHeld = state.pending.length;
+  let restored = 0;
+  let remaining = state.pending;
+  for (let attempt = 1; attempt <= 5 && remaining.length; attempt++) {
+    const result = await restorePendingQueueDetailed(remaining);
+    restored += result.restored;
+    remaining = result.failed;
+    if (!remaining.length) break;
+    state = {
+      ...state,
+      pending: remaining,
+      restoreAttempt: attempt,
+      updatedAt: new Date().toISOString(),
+    };
+    await saveHeldQueueState(state);
+    await log(`Queue handback attempt ${attempt}/5 restored ${result.restored}; ${remaining.length} item${remaining.length === 1 ? '' : 's'} will retry in five seconds.`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5000));
+  }
+  if (remaining.length) {
+    throw new Error(`${remaining.length} held queue item${remaining.length === 1 ? '' : 's'} could not be restored after five attempts`);
+  }
+  await clearHeldQueueState();
+  bulletinPlaybackUntilMs = 0;
+  await log(`Bulletin handover completed without an end skip. Restored ${restored}/${totalHeld} held song${totalHeld === 1 ? '' : 's'} only after the full ${Number(state.packageDuration).toFixed(2)}s package and protected tail had elapsed.`);
   return restored;
 }
 
-async function queueAsProgrammeItem(packagePath, packageDuration, outgoingCrossfadeSeconds = 10) {
+function launchProtectedHandover(state) {
+  if (protectedHandoverTask) return protectedHandoverTask;
+  protectedHandoverTask = protectHandoverUntilSafeEnd(state)
+    .catch(async (error) => {
+      await log(`Protected handover recovery failed: ${error.message}. Held queue state remains on disk for restart recovery.`);
+      throw error;
+    })
+    .finally(() => {
+      protectedHandoverTask = null;
+    });
+  // The task intentionally outlives the HTTP run request. Catch here as well so
+  // a failed background recovery never becomes an unhandled rejection.
+  protectedHandoverTask.catch(() => {});
+  return protectedHandoverTask;
+}
+
+function handoverState({ pending, bulletinRid, childRid, packagePath, packageDuration, protectedTail, outgoingCrossfadeSeconds, startedAtMs }) {
+  const crossfade = Math.min(60, Math.max(0, Number(outgoingCrossfadeSeconds) || 0));
+  // now-playing flips at the start of the incoming crossfade. Count that whole
+  // crossfade before the package duration, then add a small decoder grace.
+  const safeRestoreAtMs = startedAtMs + Math.ceil((crossfade + Number(packageDuration) + 5) * 1000);
+  return {
+    version: 1,
+    pending: mergeHeldUris([], pending),
+    excludedRids: [String(bulletinRid), String(childRid)].filter(Boolean),
+    bulletinRid: String(bulletinRid || ''),
+    childRid: String(childRid || ''),
+    packagePath,
+    packageDuration: Number(packageDuration),
+    protectedTailSeconds: Number(protectedTail) || 0,
+    outgoingCrossfadeSeconds: crossfade,
+    startedAtMs,
+    safeRestoreAtMs,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+async function queueAsProgrammeItem(packagePath, packageDuration, protectedTail = 12.5, outgoingCrossfadeSeconds = 10) {
   const pending = await captureAndClearPendingQueue();
-  const bulletinUri = `annotate:title="${annotateValue('Hourly News Bulletin')}",artist="${annotateValue('SUB/WAVE News')}",liq_cross_duration="0.0":${packagePath}`;
+  const exitCrossfade = Math.min(60, Math.max(0, Number(outgoingCrossfadeSeconds) || 0));
+  // Deliberately use the station crossfade at bulletin exit. The package ends in
+  // a longer silent tail, so the next song fades in over silence after every
+  // spoken word, never over the report itself. If the annotation is lost, the
+  // mixer falls back to the same global crossfade and remains safe.
+  const bulletinUri = `annotate:title="${annotateValue('Hourly News Bulletin')}",artist="${annotateValue('SUB/WAVE News')}",liq_cross_duration="${exitCrossfade.toFixed(3)}":${packagePath}`;
   let bulletinRid = '';
   let childRid = '';
   let handoverStarted = false;
-  let pendingRestoreAttempted = false;
+  let state = null;
+  let skipAt = 0;
   try {
     const alreadyPlaying = await currentNowPlaying();
     if (isNewsBulletinNowPlaying(alreadyPlaying) || bulletinPlaybackActive()) {
@@ -1890,55 +2050,64 @@ async function queueAsProgrammeItem(packagePath, packageDuration, outgoingCrossf
       throw new Error(`Liquidsoap could not resolve the bulletin request: ${resolution.failure}.${resolution.trace ? ` ${resolution.trace.slice(-500)}` : ''}`);
     }
 
-    // "Pushed [...]" only confirms URI resolution. Wait until the exact package
-    // is a non-resolving item in dj_queue. Depending on Liquidsoap, this can be
-    // the SAME RID as the annotate/root request or a newly created RID.
     const prepared = await waitForPreparedBulletinRequest(bulletinRid, packagePath, 15000);
     childRid = prepared.rid;
     await log(`Bulletin resolver RID ${bulletinRid} is prepared in dj_queue as playable RID ${childRid}${prepared.reusedResolverRid ? ' (same RID)' : ''}.`);
 
-    // SUB/WAVE can refill dj_queue while Liquidsoap is resolving the bulletin.
-    // Move anything that appeared during that window as well, leaving the exact
-    // bulletin package as the ONLY pending request when the one handover skip is
-    // finally sent. This prevents the skip/cross pipeline from advancing through
-    // queued songs while the bulletin is starting.
     const appearedDuringPreparation = await captureAndClearPendingQueue(new Set([
       String(bulletinRid),
       String(childRid),
     ]));
     pending.push(...appearedDuringPreparation);
-    await log(`Handover armed with the bulletin isolated at the front of dj_queue; ${pending.length} pending song${pending.length === 1 ? '' : 's'} will be restored only after the bulletin is confirmed on air.`);
+    await log(`Handover armed with the bulletin isolated at the front of dj_queue; ${mergeHeldUris([], pending).length} pending song${mergeHeldUris([], pending).length === 1 ? '' : 's'} will remain held until the entire package has ended.`);
 
-    const skipAt = Date.now();
+    skipAt = Date.now();
     handoverStarted = true;
     await controllerRequest('/dj/skip', { method: 'POST' });
     await waitForBulletinNowPlaying(skipAt, 20000);
-    armBulletinPlaybackGuard(Date.now(), packageDuration);
-
-    // now-playing metadata can change at the START of SUB/WAVE's incoming
-    // crossfade, while the one-shot radio.skip() is still settling through the
-    // cross source. Keep the bulletin isolated for the full configured outgoing
-    // crossfade plus a safety margin; only then put music back behind it.
-    const settleSeconds = Math.min(65, Math.max(3, (Number(outgoingCrossfadeSeconds) || 0) + 2.5));
-    await log(`Bulletin is on air; holding all songs out of dj_queue for ${settleSeconds.toFixed(1)}s while the one-shot handover cross fully settles.`);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, settleSeconds * 1000));
-    const stableNowPlaying = await currentNowPlaying();
-    const stable = isNewsBulletinNowPlaying(stableNowPlaying);
-    const restored = await restorePendingQueue(pending);
-    pendingRestoreAttempted = true;
-    if (!stable) {
-      throw new Error('The bulletin did not remain on air through the handover-settle window. Pending songs were restored, and no additional skip was sent.');
-    }
-    await log(`Bulletin playable RID ${childRid} remained on air through the full ${settleSeconds.toFixed(1)}s handover-settle window after exactly one delayed skip. Restored ${restored}/${pending.length} pending songs behind it. The ${Number(packageDuration).toFixed(2)}s package is locked against another companion skip and will play to EOF before music resumes.`);
-    return { movedPending: pending.length, restoredPending: restored, bulletinRid, childRid, skipCount: 1 };
+    const startedAtMs = Date.now();
+    state = handoverState({
+      pending,
+      bulletinRid,
+      childRid,
+      packagePath,
+      packageDuration,
+      protectedTail,
+      outgoingCrossfadeSeconds,
+      startedAtMs,
+    });
+    armBulletinPlaybackGuard(startedAtMs, packageDuration, state.safeRestoreAtMs);
+    await saveHeldQueueState(state);
+    launchProtectedHandover(state);
+    await log(`Bulletin is on air after exactly one delayed skip. The queue will stay empty for the full ${Number(packageDuration).toFixed(2)}s package, including ${Number(protectedTail).toFixed(2)}s of protected silence; no end skip will be sent.`);
+    return { movedPending: state.pending.length, restoredPending: 0, bulletinRid, childRid, skipCount: 1, safeRestoreAt: new Date(state.safeRestoreAtMs).toISOString() };
   } catch (error) {
-    // Before the skip, all captured songs can be put straight back. After a skip
-    // was sent, also restore them, but never issue a second skip: the bulletin may
-    // already have started and a retry would be the exact mid-report cutoff this
-    // handover path is designed to prevent.
-    if (!pendingRestoreAttempted) await restorePendingQueue(pending);
-    if (!handoverStarted && childRid) {
-      try { await liquidsoapCommand(`dj_queue_remove ${childRid}`); } catch {}
+    if (!handoverStarted) {
+      await restorePendingQueue(pending);
+      if (childRid) {
+        try { await liquidsoapCommand(`dj_queue_remove ${childRid}`); } catch {}
+      }
+    } else {
+      // Once the one handover skip has been sent, restoring immediately is never
+      // safe—even if metadata confirmation times out. Persist a conservative
+      // queue hold and let restart recovery finish it without another skip.
+      if (!state) {
+        const startedAtMs = skipAt;
+        state = handoverState({
+          pending,
+          bulletinRid,
+          childRid,
+          packagePath,
+          packageDuration,
+          protectedTail,
+          outgoingCrossfadeSeconds: Math.max(30, Number(outgoingCrossfadeSeconds) || 0),
+          startedAtMs,
+        });
+        armBulletinPlaybackGuard(startedAtMs, packageDuration, state.safeRestoreAtMs);
+        await saveHeldQueueState(state).catch(() => {});
+        launchProtectedHandover(state);
+        await log(`Handover confirmation failed after the skip, so a conservative on-disk queue hold was armed instead of restoring songs early. No second skip will be sent.`);
+      }
     }
     throw error;
   }
@@ -1997,14 +2166,15 @@ async function runBulletin(reason = 'manual') {
     }
     const narration = await makeNarrationAudio(config, speechPaths);
     const bulletin = await makeBulletinAudio(config, narration);
-    const packageInfo = await makeFullPackage(bulletin);
+    const packageInfo = await makeFullPackage(bulletin, snapshot.values?.crossfadeDuration);
     const packagePath = packageInfo.path;
-    await log(`Verified complete intro/news/outro package (${packageInfo.duration.toFixed(2)}s; ${generated.stories.length} stories; ${renderedChunks} TTS chunks).`);
+    await log(`Verified complete intro/news/outro package (${packageInfo.contentDuration.toFixed(2)}s programme audio + ${packageInfo.protectedTailSeconds.toFixed(2)}s protected silent tail = ${packageInfo.duration.toFixed(2)}s total; ${generated.stories.length} stories; ${renderedChunks} TTS chunks).`);
     let playback;
     if (config.interruptCurrentTrack) {
       playback = await queueAsProgrammeItem(
         packagePath,
         packageInfo.duration,
+        packageInfo.protectedTailSeconds,
         snapshot.values?.crossfadeDuration,
       );
     } else {
@@ -2026,7 +2196,7 @@ async function runBulletin(reason = 'manual') {
       lastRunStatus: 'ok',
     };
     await saveJson(SETTINGS_FILE, latest);
-    await log(`Bulletin queued in full (${freshness}; ${generated.stories.length} stories; ${renderedChunks} TTS chunks; ${packageInfo.duration.toFixed(2)}s package; ${config.storyPauseSeconds}s story gaps; ${config.interruptCurrentTrack ? 'programme-item handover with zero-duration exit crossfade' : 'foreground voice'}; moved ${playback.movedPending} pending tracks) with presenter ${presenter?.name || 'unknown'} using ${generated.provider}/${generated.model}, ${resolvedSpeech.voice.engine}/${resolvedSpeech.voice.voice || 'default'}: ${generated.text}`);
+    await log(`Bulletin queued in full (${freshness}; ${generated.stories.length} stories; ${renderedChunks} TTS chunks; ${packageInfo.duration.toFixed(2)}s package; ${config.storyPauseSeconds}s story gaps; ${config.interruptCurrentTrack ? 'programme-item handover with protected silent-tail crossfade' : 'foreground voice'}; moved ${playback.movedPending} pending tracks) with presenter ${presenter?.name || 'unknown'} using ${generated.provider}/${generated.model}, ${resolvedSpeech.voice.engine}/${resolvedSpeech.voice.voice || 'default'}: ${generated.text}`);
     return {
       ok: true,
       spoken: generated.text,
@@ -2035,6 +2205,8 @@ async function runBulletin(reason = 'manual') {
       storyPauseSeconds: config.storyPauseSeconds,
       interruptedTrack: config.interruptCurrentTrack,
       packageDurationSeconds: packageInfo.duration,
+      programmeAudioDurationSeconds: packageInfo.contentDuration,
+      protectedTailSeconds: packageInfo.protectedTailSeconds,
       ttsChunkCount: renderedChunks,
     };
   } catch (error) {
@@ -2118,6 +2290,25 @@ async function scheduleTick() {
   }
 }
 
+async function recoverHeldQueueOnStartup() {
+  if (!existsSync(HELD_QUEUE_FILE)) return;
+  const state = await loadJson(HELD_QUEUE_FILE, null);
+  if (!state || !Array.isArray(state.pending) || !Number.isFinite(Number(state.safeRestoreAtMs))) {
+    await log('Discarding malformed held-queue recovery state.');
+    await clearHeldQueueState();
+    return;
+  }
+  armBulletinPlaybackGuard(
+    Number(state.startedAtMs) || Date.now(),
+    Number(state.packageDuration) || 1,
+    Number(state.safeRestoreAtMs),
+  );
+  heldQueueState = state;
+  await log(`Recovered ${state.pending.length} held song${state.pending.length === 1 ? '' : 's'} from disk after manager restart. The queue remains protected until the bulletin-safe handback time.`);
+  launchProtectedHandover(state);
+}
+
+await recoverHeldQueueOnStartup().catch((error) => log(`Held queue startup recovery warning: ${error.message}`));
 setInterval(() => {
   scheduleTick().catch((error) => log(`Scheduler error: ${error.message}`));
 }, 5000);

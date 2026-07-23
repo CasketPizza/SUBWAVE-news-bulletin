@@ -1,5 +1,31 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.16 full-package queue protection
+
+- Fixes the remaining mid-bulletin cutoff at the actual playout boundary. The
+  previous release restored pending songs after a short crossfade-settle timer;
+  this release keeps every song completely outside `dj_queue` for the entire
+  verified bulletin package.
+- Adds a protected silent tail longer than the configured station crossfade. The
+  bulletin exits using the normal station crossfade, so the following song fades
+  in only over silence after the final spoken word. This remains safe even if
+  Liquidsoap drops the per-request crossfade annotation and falls back to the
+  global setting.
+- Continuously removes newly preloaded songs while the bulletin is on air. The
+  initial queue isolation can no longer be undone by SUB/WAVE refilling
+  `dj_queue` during the report.
+- Persists held-song state to `state/extensions/hourly-news/held-queue.json`.
+  Manager or container restarts therefore cannot restore songs early or lose the
+  queue while a bulletin is protected.
+- Performs exactly one skip, immediately before the bulletin starts. There is no
+  timer-based restore during speech and no skip at the end. Held songs are put
+  back only after the complete package, silent tail, and safety window have
+  elapsed; the autonomous playlist can begin the first post-bulletin song
+  naturally.
+- Changes timeout/error recovery after the handover skip: even when metadata
+  confirmation fails, songs stay held under a conservative on-disk guard instead
+  of being restored into the live bulletin.
+
 ## v0.5.15 isolated one-skip handover
 
 - Delays the single handover skip until the exact final bulletin package is fully
@@ -169,8 +195,8 @@ replacing any SUB/WAVE application files.
 - Still produces a recap when every live headline has already aired; if feeds are
   temporarily unavailable, it can use the last successful headline cache
 - Waits until the complete package is prepared, sends exactly one isolated handover
-  skip, restores pending songs behind the on-air bulletin, and starts the following
-  song only after the package reaches EOF
+  skip, keeps all pending and newly preloaded songs outside Liquidsoap for the full
+  report, and restores them only after the protected package has finished
 - Provides a web UI for settings, uploads, run-now testing, updates, and rollback
 - Includes progressive audience-interest tuning with recent feed examples and a
   Load more control for deeper preference training
