@@ -27,6 +27,8 @@ const UPLOAD_DIR = join(DATA_DIR, 'uploads');
 const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 const SEEN_FILE = join(DATA_DIR, 'seen.json');
 const HEADLINES_CACHE_FILE = join(DATA_DIR, 'headlines-cache.json');
+const INTEREST_ARTICLES_CACHE_FILE = join(DATA_DIR, 'interest-articles-cache.json');
+const INTERESTS_FILE = join(DATA_DIR, 'interests.json');
 const LOG_FILE = join(DATA_DIR, 'manager.log');
 const ASSET_META_FILE = join(DATA_DIR, 'assets.json');
 const SAY_FILE = join(STATE_DIR, 'say.txt');
@@ -49,6 +51,14 @@ const LOG_TAIL_BYTES = Math.min(LOG_MAX_BYTES, Math.max(16 * 1024, Number(proces
 const LOG_MAX_LINES = Math.min(500, Math.max(25, Number(process.env.LOG_MAX_LINES) || 120));
 const FFMPEG_TIMEOUT_MS = Math.min(10 * 60 * 1000, Math.max(30 * 1000, Number(process.env.FFMPEG_TIMEOUT_MS) || 3 * 60 * 1000));
 const FFPROBE_TIMEOUT_MS = Math.min(2 * 60 * 1000, Math.max(5 * 1000, Number(process.env.FFPROBE_TIMEOUT_MS) || 30 * 1000));
+
+const INTEREST_DEFAULTS = {
+  profile: '',
+  likes: [],
+  dislikes: [],
+  updatedAt: null,
+  generatedAt: null,
+};
 
 const DEFAULTS = {
   enabled: true,
@@ -169,6 +179,50 @@ async function settings() {
   return { ...DEFAULTS, ...(await loadJson(SETTINGS_FILE, DEFAULTS)) };
 }
 
+function cleanInterestProfile(value) {
+  return String(value || '')
+    .replace(/<\/?(?:think|analysis|reasoning)\b[^>]*>/gi, ' ')
+    .replace(/^```(?:json|text)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .replace(/^(?:audience )?interest profile\s*:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 1600);
+}
+
+function cleanInterestExample(value) {
+  const item = value && typeof value === 'object' ? value : {};
+  const title = String(item.title || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  if (!title) return null;
+  const source = String(item.source || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const summary = String(item.summary || item.description || '').replace(/\s+/g, ' ').trim().slice(0, 1400);
+  const link = safeWebUrl(String(item.link || '').trim()).slice(0, 2000);
+  const published = String(item.published || '').trim().slice(0, 120);
+  const key = String(item.key || hash(`${source}|${title}`)).slice(0, 128);
+  return { key, title, source, summary, link, published, selectedAt: item.selectedAt || new Date().toISOString() };
+}
+
+async function interests() {
+  const raw = await loadJson(INTERESTS_FILE, INTEREST_DEFAULTS);
+  return {
+    ...INTEREST_DEFAULTS,
+    profile: cleanInterestProfile(raw.profile),
+    likes: (Array.isArray(raw.likes) ? raw.likes : []).map(cleanInterestExample).filter(Boolean).slice(-50),
+    dislikes: (Array.isArray(raw.dislikes) ? raw.dislikes : []).map(cleanInterestExample).filter(Boolean).slice(-50),
+    updatedAt: raw.updatedAt || null,
+    generatedAt: raw.generatedAt || null,
+  };
+}
+
+function publicInterests(value) {
+  return {
+    profile: value.profile || '',
+    likeCount: value.likes?.length || 0,
+    dislikeCount: value.dislikes?.length || 0,
+    updatedAt: value.updatedAt || null,
+    generatedAt: value.generatedAt || null,
+  };
+}
 
 const ASSET_TYPES = ['intro', 'bed', 'outro'];
 
@@ -318,6 +372,94 @@ function asArray(value) {
   return Array.isArray(value) ? value : [value];
 }
 
+function decodeHtmlEntities(value) {
+  const named = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+    ndash: '–', mdash: '—', hellip: '…', lsquo: '‘', rsquo: '’',
+    ldquo: '“', rdquo: '”', bull: '•', middot: '·', copy: '©', reg: '®',
+  };
+  return String(value || '').replace(/&(#x?[0-9a-f]+|[a-z][a-z0-9]+);/gi, (match, entity) => {
+    if (entity[0] === '#') {
+      const hex = entity[1]?.toLowerCase() === 'x';
+      const code = Number.parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    return named[entity.toLowerCase()] ?? match;
+  });
+}
+
+function cleanFeedText(value) {
+  return decodeHtmlEntities(textValue(value))
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<\/?(?:p|div|br|li|h[1-6]|blockquote|section|article)\b[^>]*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\[(?:…|\.\.\.)\]\s*$/u, '…')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function completeSummary(value, maxChars = 1200) {
+  const cleaned = cleanFeedText(value)
+    .replace(/\s+(?:read|continue) more\s*(?:…|\.\.\.)?\s*$/i, '')
+    .trim();
+  if (!cleaned) return '';
+
+  const clipped = cleaned.length > maxChars ? cleaned.slice(0, maxChars + 1) : cleaned;
+  const visiblyTruncated = cleaned.length > maxChars || /(?:…|\.\.\.|\[more\])\s*$/i.test(cleaned);
+  const endsCleanly = /[.!?][\])}"'’”]*$/.test(clipped);
+  if (!visiblyTruncated && endsCleanly) return clipped;
+
+  const limit = Math.min(maxChars, clipped.length);
+  const candidate = clipped.slice(0, limit);
+  let lastEnd = -1;
+  const sentenceEnd = /[.!?][\])}"'’”]*(?=\s|$)/g;
+  for (const match of candidate.matchAll(sentenceEnd)) lastEnd = match.index + match[0].length;
+
+  // Never hand the LLM or user a sentence chopped halfway through. If the feed
+  // supplies only an incomplete teaser and no complete sentence, omit the
+  // summary and fall back to the complete headline instead.
+  if (lastEnd < 20 || lastEnd < candidate.length * 0.20) return '';
+  return candidate.slice(0, lastEnd).trim();
+}
+
+function safeWebUrl(value, base = undefined) {
+  try {
+    const url = new URL(String(value || '').trim(), base);
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function normaliseArticleItem(item) {
+  const title = cleanFeedText(item?.title).slice(0, 500);
+  const summary = completeSummary(item?.summary || item?.description || '', 1200);
+  const source = cleanFeedText(item?.source).slice(0, 120);
+  return {
+    ...item,
+    source,
+    title,
+    summary,
+    description: summary,
+    summaryComplete: Boolean(summary),
+    link: safeWebUrl(item?.link),
+    published: String(item?.published || '').trim().slice(0, 120),
+  };
+}
+
+function summaryCandidates(item) {
+  // Prefer fields intended as summaries and choose the richest complete one.
+  // Full feed content is only a fallback when no complete summary/description
+  // is available.
+  const summaries = [
+    item?.summary, item?.description, item?.['media:description'], item?.subtitle,
+  ].map((value) => completeSummary(value)).filter(Boolean).sort((a, b) => b.length - a.length);
+  if (summaries.length) return summaries;
+  return [item?.['content:encoded'], item?.content]
+    .map((value) => completeSummary(value)).filter(Boolean);
+}
+
 function parseFeed(xml, feed) {
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -331,14 +473,17 @@ function parseFeed(xml, feed) {
   const items = rssItems.length ? rssItems : atomItems;
 
   return items.map((item) => {
-    const link = typeof item.link === 'object'
+    const link = safeWebUrl(typeof item.link === 'object'
       ? item.link?.['@_href'] || textValue(item.link)
-      : textValue(item.link);
+      : textValue(item.link), feed.url);
+    const summary = summaryCandidates(item)[0] || '';
     return {
       source: feed.name || new URL(feed.url).hostname.replace(/^www\./, ''),
-      title: textValue(item.title).replace(/\s+/g, ' ').trim(),
-      description: textValue(item.description || item.summary || item.content)
-        .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 700),
+      title: cleanFeedText(item.title).slice(0, 500),
+      summary,
+      // Keep the old field for cached-data and release compatibility.
+      description: summary,
+      summaryComplete: Boolean(summary),
       link,
       published: textValue(item.pubDate || item.published || item.updated),
     };
@@ -352,7 +497,7 @@ async function fetchFeed(feed, maxItems) {
     const response = await fetch(feed.url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'SUBWAVE-News-Bulletin/0.5 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
+        'User-Agent': 'SUBWAVE-News-Bulletin/0.5.12 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
       },
     });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -404,7 +549,7 @@ async function collectHeadlines(config) {
     }).catch(() => {});
   } else {
     const cached = await loadJson(HEADLINES_CACHE_FILE, { items: [], updatedAt: null });
-    current = Array.isArray(cached.items) ? cached.items : [];
+    current = Array.isArray(cached.items) ? cached.items.map(normaliseArticleItem).filter((item) => item.title) : [];
     freshness = 'cached';
     if (!current.length) throw new Error('All configured news feeds failed and no previous headline cache is available.');
     await log(`Using cached headlines from ${cached.updatedAt || 'an earlier successful fetch'}.`);
@@ -424,6 +569,52 @@ async function collectHeadlines(config) {
   }
 
   return { candidates, ledger: old, freshness };
+}
+
+async function settleWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const runners = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      try {
+        results[index] = { status: 'fulfilled', value: await worker(items[index], index) };
+      } catch (reason) {
+        results[index] = { status: 'rejected', reason };
+      }
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function collectInterestArticles(config) {
+  const perFeed = Math.min(20, Math.max(8, Number(config.maxItemsPerFeed) || 8));
+  // The preference browser is interactive rather than time-critical. Limit feed
+  // concurrency so opening the popup cannot cause a network/CPU burst on a
+  // small SUB/WAVE VM when many sources are configured.
+  const settled = await settleWithConcurrency(config.feeds, 4, (feed) => fetchFeed(feed, perFeed));
+  const buckets = [];
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled' && result.value.length) buckets.push(result.value);
+    else if (result.status === 'rejected') {
+      void log(`Interest browser feed failed: ${config.feeds[index].name || config.feeds[index].url}: ${result.reason?.message || result.reason}`);
+    }
+  });
+
+  if (buckets.length) {
+    const items = mergeHeadlineBuckets(buckets, 60);
+    const payload = { items, updatedAt: new Date().toISOString(), cached: false };
+    await saveJson(INTEREST_ARTICLES_CACHE_FILE, payload).catch(() => {});
+    return payload;
+  }
+
+  const cached = await loadJson(INTEREST_ARTICLES_CACHE_FILE, { items: [], updatedAt: null });
+  const items = Array.isArray(cached.items)
+    ? cached.items.map(normaliseArticleItem).filter((item) => item.title).slice(0, 60)
+    : [];
+  if (!items.length) throw new Error('The configured feeds returned no articles and no interest-browser cache is available.');
+  return { items, updatedAt: cached.updatedAt || null, cached: true };
 }
 
 async function skillBrief() {
@@ -537,7 +728,7 @@ function toneLine(label, value) {
   return `${label}: balanced`;
 }
 
-function buildPrompts(snapshot, config, candidates, presenter, freshness = 'fresh') {
+function buildPrompts(snapshot, config, candidates, presenter, freshness = 'fresh', interestProfile = '') {
   const values = snapshot.values || {};
   const station = values.station || 'SUB/WAVE';
   const presenterLanguage = config.voiceMode === 'override' && config.voiceLanguage
@@ -545,7 +736,7 @@ function buildPrompts(snapshot, config, candidates, presenter, freshness = 'fres
     : (presenter.language || 'English');
   const location = values.weather?.onAirLocation || values.weather?.locationName || '';
   const rows = candidates.map((item, index) => (
-    `${index + 1}. [${item.source}] ${item.title}${item.description ? ` — ${item.description}` : ''}`
+    `${index + 1}. [${item.source}] ${item.title}${(item.summary || item.description) ? ` — ${item.summary || item.description}` : ''}`
   )).join('\n');
   const tone = [
     toneLine('Humour', presenter.humour),
@@ -581,7 +772,11 @@ ${freshnessNote}
 NEWSROOM BRIEF — STORY SELECTION
 ${config.storySelectionInstructions}
 
-SOURCE-MATERIAL HANDLING
+${interestProfile ? `AUDIENCE INTEREST PROFILE — SOFT PREFERENCE ONLY
+${interestProfile}
+Use this profile only to break ties between otherwise suitable stories. Consequence, freshness, major local or world importance, and avoiding repetition take priority. The examples that created this profile were not requests to air any particular article. Never mention the profile or those examples on air.
+
+` : ''}SOURCE-MATERIAL HANDLING
 ${config.articleHandlingInstructions}
 
 ON-AIR DELIVERY
@@ -589,7 +784,7 @@ ${config.deliveryInstructions}
 
 Use no more than ${config.maxHeadlines} stories and keep the script under approximately ${config.maxLengthSeconds} seconds when spoken.
 
-Fresh candidate headlines and RSS summaries:
+Fresh candidate headlines and complete RSS summaries. A missing summary means the feed supplied no complete, uncut sentence; use only the headline in that case:
 ${rows}
 
 Return only the finished spoken bulletin. Do not repeat any instruction or section label above.`;
@@ -730,7 +925,7 @@ function normalizeForLeakCheck(value) {
   return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-function unsafeOutputReason(stories, config) {
+function unsafeOutputReason(stories, config, interestProfile = '') {
   const text = stories.join('\n');
   const fixedPatterns = [
     /newsroom status/i,
@@ -769,6 +964,7 @@ function unsafeOutputReason(stories, config) {
     config.storySelectionInstructions,
     config.articleHandlingInstructions,
     config.deliveryInstructions,
+    interestProfile,
   ]) {
     const normalized = normalizeForLeakCheck(instruction);
     if (normalized.length >= 70 && spoken.includes(normalized.slice(0, 70))) {
@@ -934,7 +1130,7 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
   return { text: trimOutput(body?.choices?.[0]?.message?.content), stories: null };
 }
 
-async function generateStoriesWithLeg(leg, rawLlm, prompts, config, candidates) {
+async function generateStoriesWithLeg(leg, rawLlm, prompts, config, candidates, interestProfile = '') {
   const expectedMultiple = Math.min(config.maxHeadlines, candidates.length) > 1;
   let lastReason = '';
 
@@ -952,7 +1148,7 @@ RETRY CORRECTION: The previous response was unsafe because it exposed instructio
     } else if (expectedMultiple && stories.length < 2) {
       lastReason = 'did not separate multiple stories';
     } else {
-      const leak = unsafeOutputReason(stories, config);
+      const leak = unsafeOutputReason(stories, config, interestProfile);
       if (!leak) return { text: stories.join(' '), stories };
       lastReason = `contained unsafe prompt or reasoning leakage (${leak})`;
     }
@@ -963,13 +1159,13 @@ RETRY CORRECTION: The previous response was unsafe because it exposed instructio
   throw new Error(`The configured LLM ${lastReason || 'returned an invalid bulletin'} twice. Nothing was sent to TTS.`);
 }
 
-async function generateBulletinText(snapshot, config, candidates, presenter, freshness) {
-  const prompts = buildPrompts(snapshot, config, candidates, presenter, freshness);
+async function generateBulletinText(snapshot, config, candidates, presenter, freshness, interestProfile = '') {
+  const prompts = buildPrompts(snapshot, config, candidates, presenter, freshness, interestProfile);
   const rawLlm = snapshot.raw?.llm || {};
   const apiLlm = snapshot.values?.llm || {};
   const primary = { ...rawLlm, ...apiLlm };
   try {
-    const generated = await generateStoriesWithLeg(primary, rawLlm, prompts, config, candidates);
+    const generated = await generateStoriesWithLeg(primary, rawLlm, prompts, config, candidates, interestProfile);
     return { ...generated, provider: primary.provider, model: primary.model };
   } catch (primaryError) {
     const fallbackRaw = rawLlm?.fallback || {};
@@ -977,9 +1173,181 @@ async function generateBulletinText(snapshot, config, candidates, presenter, fre
     const fallback = { ...fallbackRaw, ...fallbackApi };
     if (!fallback.enabled) throw primaryError;
     await log(`Primary LLM failed; trying fallback: ${primaryError.message}`);
-    const generated = await generateStoriesWithLeg(fallback, rawLlm, prompts, config, candidates);
+    const generated = await generateStoriesWithLeg(fallback, rawLlm, prompts, config, candidates, interestProfile);
     return { ...generated, provider: fallback.provider, model: fallback.model };
   }
+}
+
+
+function interestProfileJsonSchema() {
+  return {
+    type: 'object',
+    properties: {
+      profile: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 1600,
+        description: 'A concise, durable audience news-interest profile. No analysis, headings, article list, or mention of clicking examples.',
+      },
+    },
+    required: ['profile'],
+    additionalProperties: false,
+  };
+}
+
+function parseInterestProfile(value) {
+  const text = stripReasoningBlocks(value);
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed?.profile === 'string') return cleanInterestProfile(parsed.profile);
+  } catch {}
+  const match = text.match(/\{[\s\S]*"profile"\s*:\s*"([\s\S]*?)"[\s\S]*\}/);
+  if (match) {
+    try { return cleanInterestProfile(JSON.parse(`"${match[1]}"`)); } catch {}
+  }
+  return cleanInterestProfile(text);
+}
+
+function interestProfilePrompts(likes, dislikes) {
+  const format = (items) => items.slice(-25).map((item, index) => {
+    const context = completeSummary(item.summary || item.description || '', 500);
+    return `${index + 1}. [${item.source || 'Unknown source'}] ${item.title}${context ? ` — ${context}` : ''}`;
+  }).join('\n') || '(none)';
+
+  return {
+    system: `You create a compact audience-interest profile for a radio news editor. Infer broad, durable topic and angle preferences from positive and negative example headlines. Do not request any specific example story, repeat a list of examples, infer private traits, or overfit to one named person or one-off event. Important, consequential and urgent news must always outrank taste preferences. Return only the profile text.`,
+    user: `MORE LIKE THESE EXAMPLES
+${format(likes)}
+
+LESS LIKE THESE EXAMPLES
+${format(dislikes)}
+
+Write a useful preference profile in two to five complete sentences, no more than 900 characters. Describe favoured topics or angles and topics to de-emphasise. State that preferences are soft tie-breakers and cannot displace important news. Do not mention clicks, ratings, examples, this prompt, or individual article titles.`,
+  };
+}
+
+async function generateInterestProfileWithLeg(leg, rawLlm, prompts) {
+  const provider = String(leg?.provider || '').trim();
+  const model = String(leg?.model || '').trim();
+  if (!provider || !model) throw new Error('SUB/WAVE has no LLM provider/model configured.');
+  const maxTokens = 500;
+
+  if (provider === 'ollama') {
+    const base = String(leg.ollamaUrl || rawLlm.ollamaUrl || 'http://host.docker.internal:11434').replace(/\/$/, '');
+    const body = await fetchJson(`${base}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        think: false,
+        keep_alive: '75m',
+        format: interestProfileJsonSchema(),
+        messages: [
+          { role: 'system', content: prompts.system },
+          { role: 'user', content: `${prompts.user}\n\n/no_think` },
+        ],
+        options: {
+          num_ctx: Number(leg.numCtx || rawLlm.numCtx) || undefined,
+          repeat_penalty: Number(leg.repeatPenalty || rawLlm.repeatPenalty) || undefined,
+          temperature: 0.15,
+          num_predict: maxTokens,
+        },
+      }),
+    }, 180000);
+    const profile = parseInterestProfile(body?.message?.content || body?.response || '');
+    if (!profile) throw new Error('The LLM returned no usable interest profile.');
+    return profile;
+  }
+
+  if (provider === 'anthropic') {
+    const key = providerKey(provider, rawLlm);
+    if (!key) throw new Error('ANTHROPIC_API_KEY is not available to the companion.');
+    const body = await fetchJson('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model, max_tokens: maxTokens, temperature: 0.2, system: prompts.system, messages: [{ role: 'user', content: prompts.user }] }),
+    });
+    return parseInterestProfile((body?.content || []).map((item) => item?.text || '').join('\n'));
+  }
+
+  if (provider === 'google') {
+    const key = providerKey(provider, rawLlm);
+    if (!key) throw new Error('GOOGLE_GENERATIVE_AI_API_KEY is not available to the companion.');
+    const body = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: prompts.system }] },
+        contents: [{ role: 'user', parts: [{ text: prompts.user }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens },
+      }),
+    });
+    return parseInterestProfile(body?.candidates?.[0]?.content?.parts?.map((part) => part?.text || '').join('\n'));
+  }
+
+  let base = '';
+  const key = providerKey(provider, rawLlm);
+  if (provider === 'openai') base = 'https://api.openai.com/v1';
+  else if (provider === 'deepseek') base = 'https://api.deepseek.com/v1';
+  else if (provider === 'openrouter') base = 'https://openrouter.ai/api/v1';
+  else if (['openai-compatible', 'locca', 'requesty', 'gateway'].includes(provider)) {
+    base = baseUrlFor(provider, leg, rawLlm);
+    if (!base) throw new Error(`${provider} has no base URL configured.`);
+  } else {
+    throw new Error(`The companion does not yet support SUB/WAVE LLM provider "${provider}".`);
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (key) headers.Authorization = `Bearer ${key}`;
+  const body = await fetchJson(`${base}/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      max_tokens: maxTokens,
+      messages: [{ role: 'system', content: prompts.system }, { role: 'user', content: prompts.user }],
+    }),
+  });
+  return parseInterestProfile(body?.choices?.[0]?.message?.content || '');
+}
+
+async function generateInterestProfile(snapshot, likes, dislikes) {
+  const prompts = interestProfilePrompts(likes, dislikes);
+  const rawLlm = snapshot.raw?.llm || {};
+  const apiLlm = snapshot.values?.llm || {};
+  const primary = { ...rawLlm, ...apiLlm };
+  try {
+    return await generateInterestProfileWithLeg(primary, rawLlm, prompts);
+  } catch (primaryError) {
+    const fallback = { ...(rawLlm?.fallback || {}), ...(apiLlm?.fallback || {}) };
+    if (!fallback.enabled) throw primaryError;
+    await log(`Primary LLM failed while generating interest profile; trying fallback: ${primaryError.message}`);
+    return generateInterestProfileWithLeg(fallback, rawLlm, prompts);
+  }
+}
+
+function mergeInterestSelections(current, selections, visibleKeys) {
+  const visible = new Set((Array.isArray(visibleKeys) ? visibleKeys : []).map(String));
+  const likes = new Map((current.likes || []).filter((item) => !visible.has(item.key)).map((item) => [item.key, item]));
+  const dislikes = new Map((current.dislikes || []).filter((item) => !visible.has(item.key)).map((item) => [item.key, item]));
+
+  for (const raw of Array.isArray(selections) ? selections : []) {
+    const item = cleanInterestExample(raw);
+    if (!item) continue;
+    const rating = raw.rating === 'like' ? 'like' : raw.rating === 'dislike' ? 'dislike' : 'neutral';
+    likes.delete(item.key);
+    dislikes.delete(item.key);
+    if (rating === 'like') likes.set(item.key, item);
+    if (rating === 'dislike') dislikes.set(item.key, item);
+  }
+
+  const byNewest = (a, b) => String(a.selectedAt).localeCompare(String(b.selectedAt));
+  return {
+    likes: [...likes.values()].sort(byNewest).slice(-50),
+    dislikes: [...dislikes.values()].sort(byNewest).slice(-50),
+  };
 }
 
 function resolveVoice(snapshot, config, presenter = resolvePresenter(snapshot, config)) {
@@ -1433,10 +1801,11 @@ async function runBulletin(reason = 'manual') {
     const { candidates, ledger, freshness } = await collectHeadlines(config);
 
     const snapshot = await subwaveSnapshot();
+    const audienceInterests = await interests();
     const presenter = resolvePresenter(snapshot, config);
     const activeLlm = snapshot.values?.llm || snapshot.raw?.llm || {};
     await log(`Generating bulletin script with ${activeLlm.provider || 'unknown'}/${activeLlm.model || 'unknown'} (${freshness}; ${candidates.length} candidates).`);
-    const generated = await generateBulletinText(snapshot, config, candidates, presenter, freshness);
+    const generated = await generateBulletinText(snapshot, config, candidates, presenter, freshness, audienceInterests.profile);
     await log(`Bulletin script ready (${generated.stories.length} stories). Starting TTS.`);
     const speechPaths = [];
     let resolvedSpeech = null;
@@ -1780,9 +2149,11 @@ app.get('/api/settings', async (_req, res) => {
     await log(`Could not load presenter/voice options: ${error.message}`);
   }
 
+  const audienceInterests = await interests();
   res.json({
     settings: config,
     assets,
+    interests: publicInterests(audienceInterests),
     options,
     defaults: {
       storySelectionInstructions: DEFAULTS.storySelectionInstructions,
@@ -1801,6 +2172,70 @@ app.put('/api/settings', async (req, res) => {
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
+});
+
+
+app.get('/api/interests/articles', async (_req, res) => {
+  try {
+    const config = await settings();
+    const result = await collectInterestArticles(config);
+    const audienceInterests = await interests();
+    const ratings = {};
+    for (const item of audienceInterests.likes) ratings[item.key] = 'like';
+    for (const item of audienceInterests.dislikes) ratings[item.key] = 'dislike';
+    res.json({ ...result, ratings });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post('/api/interests/generate', async (req, res) => {
+  try {
+    const current = await interests();
+    const merged = mergeInterestSelections(current, req.body?.selections, req.body?.visibleKeys);
+    if (!merged.likes.length && !merged.dislikes.length) {
+      throw new Error('Mark at least one article as More like this or Less like this first.');
+    }
+    const snapshot = await subwaveSnapshot();
+    await log(`Generating audience interest profile from ${merged.likes.length} positive and ${merged.dislikes.length} negative examples.`);
+    const profile = await generateInterestProfile(snapshot, merged.likes, merged.dislikes);
+    if (!profile) throw new Error('The LLM returned an empty interest profile.');
+    const saved = {
+      profile,
+      likes: merged.likes,
+      dislikes: merged.dislikes,
+      updatedAt: new Date().toISOString(),
+      generatedAt: new Date().toISOString(),
+    };
+    await saveJson(INTERESTS_FILE, saved);
+    await log('Audience interest profile updated.');
+    res.json({ ok: true, interests: publicInterests(saved) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.put('/api/interests/profile', async (req, res) => {
+  try {
+    const current = await interests();
+    const saved = {
+      ...current,
+      profile: cleanInterestProfile(req.body?.profile),
+      updatedAt: new Date().toISOString(),
+    };
+    await saveJson(INTERESTS_FILE, saved);
+    await log(saved.profile ? 'Audience interest profile edited manually.' : 'Audience interest profile text cleared; examples retained.');
+    res.json({ ok: true, interests: publicInterests(saved) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.delete('/api/interests', async (_req, res) => {
+  const cleared = { ...INTEREST_DEFAULTS, updatedAt: new Date().toISOString() };
+  await saveJson(INTERESTS_FILE, cleared);
+  await log('Audience interest profile and examples reset.');
+  res.json({ ok: true, interests: publicInterests(cleared) });
 });
 
 app.post('/api/assets/:type', upload.single('file'), async (req, res) => {

@@ -7,6 +7,10 @@ let noticeTimer = null;
 let logRefreshTimer = null;
 let logRequestInFlight = false;
 let statusRequestPromise = null;
+let interestModel = { profile: '', likes: [], dislikes: [], likeCount: 0, dislikeCount: 0 };
+let interestArticles = [];
+let interestRatings = new Map();
+let interestArticlesLoaded = false;
 
 // The manager is normally reverse-proxied below /news-bulletin/. Resolve every
 // request relative to the page so the same build also works directly at /.
@@ -21,6 +25,8 @@ class AuthenticationRequiredError extends Error {
 }
 
 function showAuthenticationRequired(message = '') {
+  const interestDialog = $('interestDialog');
+  if (interestDialog?.open) interestDialog.close();
   const panel = $('authRequired');
   const text = $('authMessage');
   if (text && message) text.textContent = message;
@@ -204,6 +210,7 @@ async function load() {
   assets = payload.assets;
   options = payload.options || {};
   instructionDefaults = payload.defaults || {};
+  setInterestModel(payload.interests || {});
 
   $('feeds').innerHTML = '';
   model.feeds.forEach(feedRow);
@@ -262,6 +269,227 @@ function collect() {
     bedFadeOut: Number($('bedFadeOut').value),
     loopBed: $('loopBed').checked,
   };
+}
+
+
+function setInterestModel(value = {}) {
+  interestModel = {
+    profile: String(value.profile || ''),
+    likes: Array.isArray(value.likes) ? value.likes : [],
+    dislikes: Array.isArray(value.dislikes) ? value.dislikes : [],
+    likeCount: Number(value.likeCount ?? value.likes?.length) || 0,
+    dislikeCount: Number(value.dislikeCount ?? value.dislikes?.length) || 0,
+    updatedAt: value.updatedAt || null,
+    generatedAt: value.generatedAt || null,
+  };
+  const profile = interestModel.profile.trim();
+  $('interestProfileSummary').textContent = profile || 'No interest profile yet. Important news and the written selection instructions remain in control.';
+  $('interestExampleCount').textContent = `${interestModel.likeCount} preferred · ${interestModel.dislikeCount} de-emphasised examples`;
+  $('interestProfileEditor').value = profile;
+}
+
+function setInterestStatus(message, error = false) {
+  const box = $('interestStatusMessage');
+  box.textContent = message || '';
+  box.classList.toggle('error', Boolean(error));
+}
+
+function articleDate(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function ratingFor(key) {
+  return interestRatings.get(key) || 'neutral';
+}
+
+function updateInterestCounts() {
+  let likes = 0;
+  let dislikes = 0;
+  for (const article of interestArticles) {
+    const rating = ratingFor(article.key);
+    if (rating === 'like') likes += 1;
+    if (rating === 'dislike') dislikes += 1;
+  }
+  $('interestSelectionCount').textContent = `${likes} preferred · ${dislikes} de-emphasised`;
+}
+
+function renderInterestArticles() {
+  const list = $('interestArticles');
+  const query = $('interestSearch').value.trim().toLowerCase();
+  const source = $('interestSourceFilter').value;
+  const ratingFilter = $('interestRatingFilter').value;
+  const shown = interestArticles.filter((article) => {
+    const rating = ratingFor(article.key);
+    const haystack = `${article.title || ''} ${article.summary || article.description || ''}`.toLowerCase();
+    return (!source || article.source === source)
+      && (!ratingFilter || rating === ratingFilter)
+      && (!query || haystack.includes(query));
+  });
+
+  list.innerHTML = '';
+  if (!shown.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = interestArticles.length ? 'No articles match the current filters.' : 'No articles are available.';
+    list.appendChild(empty);
+    updateInterestCounts();
+    return;
+  }
+
+  for (const article of shown) {
+    const rating = ratingFor(article.key);
+    const card = document.createElement('article');
+    card.className = `interest-article rating-${rating}`;
+    const summary = article.summary || article.description || '';
+    const headline = article.link
+      ? `<a href="${escapeHtml(article.link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(article.title)}</a>`
+      : escapeHtml(article.title);
+    card.innerHTML = `
+      <div class="interest-meta"><span>${escapeHtml(article.source || 'Unknown source')}</span>${article.published ? `<time>${escapeHtml(articleDate(article.published))}</time>` : ''}</div>
+      <h3>${headline}</h3>
+      <p class="interest-summary ${summary ? '' : 'missing'}">${summary ? escapeHtml(summary) : 'No complete summary was supplied by this feed. The editor will use only the full headline rather than an incomplete teaser.'}</p>
+      <div class="interest-rating" role="group" aria-label="Rate this article as an interest example">
+        <button type="button" data-interest-key="${escapeHtml(article.key)}" data-interest-rating="like" aria-pressed="${rating === 'like'}">More like this</button>
+        <button type="button" data-interest-key="${escapeHtml(article.key)}" data-interest-rating="dislike" aria-pressed="${rating === 'dislike'}">Less like this</button>
+        <button type="button" data-interest-key="${escapeHtml(article.key)}" data-interest-rating="neutral" aria-pressed="${rating === 'neutral'}">Neutral</button>
+      </div>`;
+    list.appendChild(card);
+  }
+
+  list.querySelectorAll('[data-interest-rating]').forEach((button) => {
+    button.onclick = () => {
+      interestRatings.set(button.dataset.interestKey, button.dataset.interestRating);
+      renderInterestArticles();
+    };
+  });
+  updateInterestCounts();
+}
+
+function populateInterestSources() {
+  const select = $('interestSourceFilter');
+  const previous = select.value;
+  select.innerHTML = '<option value="">All sources</option>';
+  const sources = [...new Set(interestArticles.map((item) => item.source).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  for (const source of sources) select.appendChild(optionElement(source, source));
+  if ([...select.options].some((item) => item.value === previous)) select.value = previous;
+}
+
+async function loadInterestArticles(force = false) {
+  if (interestArticlesLoaded && !force) {
+    renderInterestArticles();
+    return;
+  }
+  const button = $('refreshInterestArticles');
+  button.disabled = true;
+  setInterestStatus('Loading recent articles from the configured feeds…');
+  $('interestArticles').innerHTML = '<p class="empty-state">Loading recent articles…</p>';
+  try {
+    const pendingRatings = new Map(interestRatings);
+    const payload = await api(`/api/interests/articles?refresh=${force ? 1 : 0}`);
+    interestArticles = Array.isArray(payload.items) ? payload.items : [];
+    interestRatings = new Map(Object.entries(payload.ratings || {}));
+    // A manual refresh should not silently throw away choices made since the
+    // popup was opened. Keep pending local ratings for articles still present.
+    for (const article of interestArticles) {
+      if (pendingRatings.has(article.key)) interestRatings.set(article.key, pendingRatings.get(article.key));
+    }
+    interestArticlesLoaded = true;
+    populateInterestSources();
+    $('interestArticleFreshness').textContent = payload.cached
+      ? `Cached feed results${payload.updatedAt ? ` from ${articleDate(payload.updatedAt)}` : ''}`
+      : `Updated ${payload.updatedAt ? articleDate(payload.updatedAt) : 'now'}`;
+    setInterestStatus(`${interestArticles.length} recent articles loaded. Rate broad examples, then generate the profile once.`);
+    renderInterestArticles();
+  } catch (error) {
+    setInterestStatus(error.message, true);
+    $('interestArticles').innerHTML = '<p class="empty-state">Articles could not be loaded. Check Recent actions for feed errors.</p>';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function interestSelectionPayload() {
+  return {
+    visibleKeys: interestArticles.map((article) => article.key),
+    selections: interestArticles
+      .filter((article) => ['like', 'dislike'].includes(ratingFor(article.key)))
+      .map((article) => ({
+        key: article.key,
+        rating: ratingFor(article.key),
+        title: article.title,
+        source: article.source,
+        summary: article.summary || article.description || '',
+        link: article.link || '',
+        published: article.published || '',
+        selectedAt: new Date().toISOString(),
+      })),
+  };
+}
+
+async function generateInterestProfileFromChoices() {
+  const button = $('generateInterestProfile');
+  button.disabled = true;
+  setInterestStatus('Generating a concise interest profile with the configured SUB/WAVE LLM. This may take a minute.');
+  try {
+    const result = await api('/api/interests/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(interestSelectionPayload()),
+    });
+    setInterestModel(result.interests || {});
+    setInterestStatus('Interest profile generated and saved. It will influence future selection only as a soft tie-breaker.');
+    notice('Audience interest profile updated.');
+  } catch (error) {
+    setInterestStatus(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function saveEditedInterestProfile() {
+  const button = $('saveInterestProfile');
+  button.disabled = true;
+  try {
+    const result = await api('/api/interests/profile', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: $('interestProfileEditor').value }),
+    });
+    setInterestModel(result.interests || {});
+    setInterestStatus('Edited profile saved.');
+    notice('Audience interest profile saved.');
+  } catch (error) {
+    setInterestStatus(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function resetAllInterests() {
+  if (!window.confirm('Reset the generated profile and every saved More like this / Less like this example?')) return;
+  try {
+    const result = await api('/api/interests', { method: 'DELETE' });
+    setInterestModel(result.interests || {});
+    interestRatings.clear();
+    renderInterestArticles();
+    setInterestStatus('All saved interests were reset.');
+    notice('Audience interests reset.');
+  } catch (error) {
+    setInterestStatus(error.message, true);
+  }
+}
+
+async function openInterestTuner() {
+  const dialog = $('interestDialog');
+  if (!dialog.open) dialog.showModal();
+  $('interestProfileEditor').value = interestModel.profile || '';
+  await loadInterestArticles(false);
+}
+
+function closeInterestTuner() {
+  $('interestDialog').close();
 }
 
 function assetRecord(type) {
@@ -407,6 +635,21 @@ async function command(path, message) {
   const result = await api(path, { method: 'POST' });
   notice(result.message || message);
 }
+
+
+$('tuneInterests').onclick = () => openInterestTuner().catch((error) => setInterestStatus(error.message, true));
+$('closeInterests').onclick = closeInterestTuner;
+$('closeInterestsTop').onclick = closeInterestTuner;
+$('refreshInterestArticles').onclick = () => loadInterestArticles(true);
+$('interestSearch').oninput = renderInterestArticles;
+$('interestSourceFilter').onchange = renderInterestArticles;
+$('interestRatingFilter').onchange = renderInterestArticles;
+$('generateInterestProfile').onclick = generateInterestProfileFromChoices;
+$('saveInterestProfile').onclick = saveEditedInterestProfile;
+$('resetInterests').onclick = resetAllInterests;
+$('interestDialog').addEventListener('click', (event) => {
+  if (event.target === $('interestDialog')) closeInterestTuner();
+});
 
 $('addFeed').onclick = () => feedRow();
 $('save').onclick = () => save().catch((error) => notice(error.message, true));

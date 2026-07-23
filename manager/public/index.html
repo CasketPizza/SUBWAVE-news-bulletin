@@ -124,7 +124,16 @@
         </label>
       </div>
 
-      <p class="hard-rule">Accuracy safeguards remain enforced even when these instructions are customised: the bulletin cannot invent facts, merge unrelated reports, or turn allegations and uncertainty into certainty.</p>
+      <div class="interest-panel">
+        <div>
+          <h3>Audience interests</h3>
+          <p id="interestProfileSummary">No interest profile yet. Important news and the written selection instructions remain in control.</p>
+          <small id="interestExampleCount" class="field-help">0 preferred · 0 de-emphasised examples</small>
+        </div>
+        <button id="tuneInterests" type="button">Tune news interests</button>
+      </div>
+
+      <p class="hard-rule">Accuracy safeguards remain enforced even when these instructions are customised: the bulletin cannot invent facts, merge unrelated reports, or turn allegations and uncertainty into certainty. Audience interests are only a soft tie-breaker and cannot displace important news.</p>
     </section>
 
     <section>
@@ -220,6 +229,62 @@
       <pre id="logs">Debug log paused. Click Refresh once or enable live debugging.</pre>
     </section>
   </main>
+  <dialog id="interestDialog" class="interest-dialog" aria-labelledby="interestDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">AUDIENCE TUNING</p>
+          <h2 id="interestDialogTitle">Teach the editor what interests you</h2>
+          <p>Rate examples as <strong>More like this</strong> or <strong>Less like this</strong>. These are preference examples only: they do not request any particular story for the next bulletin.</p>
+        </div>
+        <button id="closeInterestsTop" class="dialog-close" type="button" aria-label="Close">×</button>
+      </div>
+
+      <p class="hard-rule interest-rule">Importance, freshness, major local and world consequences, and avoiding repetition always outrank this profile.</p>
+      <div id="interestStatusMessage" class="dialog-status" aria-live="polite"></div>
+
+      <div class="interest-toolbar">
+        <label>Search headlines
+          <input id="interestSearch" type="search" placeholder="Search titles and summaries">
+        </label>
+        <label>Source
+          <select id="interestSourceFilter"><option value="">All sources</option></select>
+        </label>
+        <label>Rating
+          <select id="interestRatingFilter">
+            <option value="">All articles</option>
+            <option value="like">More like this</option>
+            <option value="dislike">Less like this</option>
+            <option value="neutral">Not rated</option>
+          </select>
+        </label>
+        <button id="refreshInterestArticles" type="button">Refresh articles</button>
+      </div>
+
+      <div class="interest-list-heading">
+        <strong id="interestSelectionCount">0 preferred · 0 de-emphasised</strong>
+        <span id="interestArticleFreshness"></span>
+      </div>
+      <div id="interestArticles" class="interest-articles">
+        <p class="empty-state">Open the tuner to load recent articles.</p>
+      </div>
+
+      <div class="interest-profile-editor">
+        <label>Current editable interest profile
+          <textarea id="interestProfileEditor" rows="6" maxlength="1600" placeholder="The generated profile will appear here."></textarea>
+        </label>
+        <small class="field-help">The profile is inserted into story selection as a soft preference. The LLM sees complete feed summaries where available; incomplete teaser fragments are omitted rather than cut off mid-sentence.</small>
+      </div>
+
+      <div class="dialog-actions">
+        <button id="generateInterestProfile" class="primary" type="button">Save choices &amp; generate profile</button>
+        <button id="saveInterestProfile" type="button">Save edited profile</button>
+        <button id="resetInterests" type="button">Reset all interests</button>
+        <button id="closeInterests" type="button">Close</button>
+      </div>
+    </div>
+  </dialog>
+
   <section id="authRequired" class="auth-screen hidden" role="alertdialog" aria-modal="true" aria-labelledby="authTitle">
     <div class="auth-card">
       <p class="eyebrow">AUTHENTICATION REQUIRED</p>
