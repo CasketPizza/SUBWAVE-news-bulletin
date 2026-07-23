@@ -1,5 +1,23 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.15 isolated one-skip handover
+
+- Delays the single handover skip until the exact final bulletin package is fully
+  resolved and prepared in Liquidsoap. No skip is sent during script generation,
+  TTS rendering, audio assembly, or URI resolution.
+- Isolates the bulletin as the only pending `dj_queue` item at the instant of the
+  skip. Songs that were already queued, plus any songs SUB/WAVE added while the
+  bulletin was preparing, are held aside until the bulletin is confirmed on air.
+- Keeps every song out of `dj_queue` for the complete configured incoming
+  crossfade plus a safety margin after the bulletin first appears on air. Pending
+  songs are restored only after the one-shot skip/cross is fully settled, then
+  resume naturally after report EOF; the companion never skips at the end.
+- Adds an on-air playback lock for the complete verified package duration plus a
+  short decoder grace period. Scheduled or manual duplicate runs cannot issue a
+  second companion skip while the newscaster is speaking.
+- Shows **Bulletin on air — protected** in the status panel while that lock is
+  active.
+
 ## v0.5.14 complete-report TTS and playout
 
 - Removes the **Maximum spoken length** setting and its prompt-level time target.
@@ -150,8 +168,9 @@ replacing any SUB/WAVE application files.
 - Inserts a configurable, real silence gap between separately rendered stories
 - Still produces a recap when every live headline has already aired; if feeds are
   temporarily unavailable, it can use the last successful headline cache
-- Ends the current song, inserts the complete bulletin as the next main programme
-  item, preserves pending song order, and starts the following song after the outro
+- Waits until the complete package is prepared, sends exactly one isolated handover
+  skip, restores pending songs behind the on-air bulletin, and starts the following
+  song only after the package reaches EOF
 - Provides a web UI for settings, uploads, run-now testing, updates, and rollback
 - Includes progressive audience-interest tuning with recent feed examples and a
   Load more control for deeper preference training

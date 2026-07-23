@@ -609,7 +609,13 @@ async function loadStatus(forceUpdateCheck = false) {
 }
 
 function renderStatus(status) {
-  $('managerStatus').textContent = status.busy ? 'Preparing bulletin…' : 'Running';
+  $('managerStatus').textContent = status.busy
+    ? 'Preparing bulletin…'
+    : status.bulletinOnAir
+      ? `Bulletin on air — protected${status.bulletinPlaybackRemainingSeconds ? ` (${status.bulletinPlaybackRemainingSeconds}s)` : ''}`
+      : 'Running';
+  $('runNow').disabled = Boolean(status.busy || status.bulletinOnAir);
+  $('runNow').textContent = status.bulletinOnAir ? 'Bulletin on air' : 'Run bulletin now';
   $('versionStatus').textContent = status.updateAvailable
     ? `${status.version}${status.latestVersion ? ` → ${status.latestVersion}` : ''} — update available`
     : status.updateCheckError
@@ -700,7 +706,7 @@ $('runNow').onclick = async () => {
   } catch (error) {
     notice(error.message, true);
   } finally {
-    $('runNow').disabled = false;
+    await loadStatus().catch(() => {});
   }
 };
 

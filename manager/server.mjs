@@ -1677,11 +1677,12 @@ function annotateValue(value) {
   return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
-async function captureAndClearPendingQueue() {
+async function captureAndClearPendingQueue(excludedRids = new Set()) {
   const raw = await liquidsoapCommand('dj_queue.queue');
   const rids = String(raw).trim().split(/\s+/).filter(Boolean);
   const saved = [];
   for (const rid of rids) {
+    if (excludedRids.has(String(rid))) continue;
     try {
       const metadata = await liquidsoapCommand(`request.metadata ${rid}`);
       const uri = initialUriFromMetadata(metadata);
@@ -1824,15 +1825,66 @@ async function waitForBulletinNowPlaying(notBeforeMs, timeoutMs = 20000) {
   throw new Error(`The bulletin was prepared, but SUB/WAVE still reported ${description} after one safe skip. No additional songs were skipped.`);
 }
 
-async function queueAsProgrammeItem(packagePath, packageDuration) {
+let bulletinPlaybackUntilMs = 0;
+let bulletinPlaybackStartedAt = null;
+let bulletinPlaybackDurationSeconds = 0;
+
+function bulletinPlaybackActive() {
+  return Date.now() < bulletinPlaybackUntilMs;
+}
+
+function armBulletinPlaybackGuard(startedAtMs, durationSeconds) {
+  const seconds = Math.max(1, Number(durationSeconds) || 1);
+  bulletinPlaybackStartedAt = new Date(startedAtMs).toISOString();
+  bulletinPlaybackDurationSeconds = seconds;
+  // Hold the companion's skip/run lock for the entire verified package plus a
+  // small decoder/metadata grace period. This does not stop normal EOF playout;
+  // it only prevents this companion from issuing another handover skip while
+  // the newscaster is still speaking.
+  bulletinPlaybackUntilMs = startedAtMs + Math.ceil(seconds * 1000) + 15000;
+}
+
+async function currentNowPlaying() {
+  try {
+    return JSON.parse(await readFile(NOW_PLAYING_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function isNewsBulletinNowPlaying(value) {
+  return String(value?.title || '').trim() === 'Hourly News Bulletin'
+    && String(value?.artist || '').trim() === 'SUB/WAVE News';
+}
+
+async function restorePendingQueue(pending) {
+  let restored = 0;
+  for (const uri of pending) {
+    try {
+      await pushLiquidsoapRequest(uri);
+      restored += 1;
+    } catch (error) {
+      await log(`Could not restore a pending song behind the bulletin: ${error.message}`);
+    }
+  }
+  return restored;
+}
+
+async function queueAsProgrammeItem(packagePath, packageDuration, outgoingCrossfadeSeconds = 10) {
   const pending = await captureAndClearPendingQueue();
   const bulletinUri = `annotate:title="${annotateValue('Hourly News Bulletin')}",artist="${annotateValue('SUB/WAVE News')}",liq_cross_duration="0.0":${packagePath}`;
-  let restored = 0;
   let bulletinRid = '';
   let childRid = '';
+  let handoverStarted = false;
+  let pendingRestoreAttempted = false;
   try {
+    const alreadyPlaying = await currentNowPlaying();
+    if (isNewsBulletinNowPlaying(alreadyPlaying) || bulletinPlaybackActive()) {
+      throw new Error('A news bulletin is already on air. No handover skip was sent.');
+    }
+
     bulletinRid = await pushLiquidsoapRequest(bulletinUri);
-    await log(`Bulletin audio queued in Liquidsoap as resolver RID ${bulletinRid}; waiting for URI resolution.`);
+    await log(`Bulletin audio queued in Liquidsoap as resolver RID ${bulletinRid}; waiting for URI resolution. No song will be skipped until the exact package is ready.`);
     const resolution = await waitForRequestResolution(bulletinRid, 15000);
     if (!resolution.resolved) {
       throw new Error(`Liquidsoap could not resolve the bulletin request: ${resolution.failure}.${resolution.trace ? ` ${resolution.trace.slice(-500)}` : ''}`);
@@ -1845,26 +1897,47 @@ async function queueAsProgrammeItem(packagePath, packageDuration) {
     childRid = prepared.rid;
     await log(`Bulletin resolver RID ${bulletinRid} is prepared in dj_queue as playable RID ${childRid}${prepared.reusedResolverRid ? ' (same RID)' : ''}.`);
 
-    // Restore the operator's pending queue only after the bulletin child is
-    // definitely first and ready. This preserves pending order behind it.
-    for (const uri of pending) {
-      await pushLiquidsoapRequest(uri);
-      restored += 1;
-    }
+    // SUB/WAVE can refill dj_queue while Liquidsoap is resolving the bulletin.
+    // Move anything that appeared during that window as well, leaving the exact
+    // bulletin package as the ONLY pending request when the one handover skip is
+    // finally sent. This prevents the skip/cross pipeline from advancing through
+    // queued songs while the bulletin is starting.
+    const appearedDuringPreparation = await captureAndClearPendingQueue(new Set([
+      String(bulletinRid),
+      String(childRid),
+    ]));
+    pending.push(...appearedDuringPreparation);
+    await log(`Handover armed with the bulletin isolated at the front of dj_queue; ${pending.length} pending song${pending.length === 1 ? '' : 's'} will be restored only after the bulletin is confirmed on air.`);
 
     const skipAt = Date.now();
+    handoverStarted = true;
     await controllerRequest('/dj/skip', { method: 'POST' });
     await waitForBulletinNowPlaying(skipAt, 20000);
-    await log(`Bulletin playable RID ${childRid} confirmed on air after one safe handover skip. The ${Number(packageDuration).toFixed(2)}s package will now play to EOF with a zero-duration exit crossfade before music resumes.`);
-    return { movedPending: pending.length, bulletinRid, childRid, skipCount: 1 };
-  } catch (error) {
-    for (const uri of pending.slice(restored)) {
-      try { await pushLiquidsoapRequest(uri); } catch {}
+    armBulletinPlaybackGuard(Date.now(), packageDuration);
+
+    // now-playing metadata can change at the START of SUB/WAVE's incoming
+    // crossfade, while the one-shot radio.skip() is still settling through the
+    // cross source. Keep the bulletin isolated for the full configured outgoing
+    // crossfade plus a safety margin; only then put music back behind it.
+    const settleSeconds = Math.min(65, Math.max(3, (Number(outgoingCrossfadeSeconds) || 0) + 2.5));
+    await log(`Bulletin is on air; holding all songs out of dj_queue for ${settleSeconds.toFixed(1)}s while the one-shot handover cross fully settles.`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, settleSeconds * 1000));
+    const stableNowPlaying = await currentNowPlaying();
+    const stable = isNewsBulletinNowPlaying(stableNowPlaying);
+    const restored = await restorePendingQueue(pending);
+    pendingRestoreAttempted = true;
+    if (!stable) {
+      throw new Error('The bulletin did not remain on air through the handover-settle window. Pending songs were restored, and no additional skip was sent.');
     }
-    // A failed confirmation must not leave a bulletin lurking in the editable
-    // queue to surprise the operator later. Best-effort removal only; never send
-    // another skip because that could cut a bulletin that actually started.
-    if (childRid) {
+    await log(`Bulletin playable RID ${childRid} remained on air through the full ${settleSeconds.toFixed(1)}s handover-settle window after exactly one delayed skip. Restored ${restored}/${pending.length} pending songs behind it. The ${Number(packageDuration).toFixed(2)}s package is locked against another companion skip and will play to EOF before music resumes.`);
+    return { movedPending: pending.length, restoredPending: restored, bulletinRid, childRid, skipCount: 1 };
+  } catch (error) {
+    // Before the skip, all captured songs can be put straight back. After a skip
+    // was sent, also restore them, but never issue a second skip: the bulletin may
+    // already have started and a retry would be the exact mid-report cutoff this
+    // handover path is designed to prevent.
+    if (!pendingRestoreAttempted) await restorePendingQueue(pending);
+    if (!handoverStarted && childRid) {
       try { await liquidsoapCommand(`dj_queue_remove ${childRid}`); } catch {}
     }
     throw error;
@@ -1890,6 +1963,13 @@ async function queueAudio(path) {
 let runBusy = false;
 async function runBulletin(reason = 'manual') {
   if (runBusy) throw new Error('A bulletin is already being prepared.');
+  if (isNewsBulletinNowPlaying(await currentNowPlaying())) {
+    throw new Error('A bulletin is already on air. No new handover skip was sent.');
+  }
+  if (bulletinPlaybackActive()) {
+    const remaining = Math.max(1, Math.ceil((bulletinPlaybackUntilMs - Date.now()) / 1000));
+    throw new Error(`A bulletin is still on air. No new skip will be sent for approximately ${remaining} more seconds.`);
+  }
   runBusy = true;
   const config = await settings();
   try {
@@ -1922,7 +2002,11 @@ async function runBulletin(reason = 'manual') {
     await log(`Verified complete intro/news/outro package (${packageInfo.duration.toFixed(2)}s; ${generated.stories.length} stories; ${renderedChunks} TTS chunks).`);
     let playback;
     if (config.interruptCurrentTrack) {
-      playback = await queueAsProgrammeItem(packagePath, packageInfo.duration);
+      playback = await queueAsProgrammeItem(
+        packagePath,
+        packageInfo.duration,
+        snapshot.values?.crossfadeDuration,
+      );
     } else {
       await queueAudio(packagePath);
       playback = { movedPending: 0 };
@@ -2005,7 +2089,8 @@ function zonedParts(timeZone) {
 
 async function scheduleTick() {
   const config = await settings();
-  if (!config.enabled || config.scheduleMode === 'manual' || runBusy) return;
+  if (!config.enabled || config.scheduleMode === 'manual' || runBusy || bulletinPlaybackActive()) return;
+  if (isNewsBulletinNowPlaying(await currentNowPlaying())) return;
 
   let parts;
   try {
@@ -2410,9 +2495,17 @@ app.get('/api/status', async (req, res) => {
   } catch (error) {
     subwave.error = error.message;
   }
+  const nowPlaying = await currentNowPlaying();
+  const bulletinOnAir = bulletinPlaybackActive() || isNewsBulletinNowPlaying(nowPlaying);
   res.json({
     manager: 'running',
     busy: runBusy,
+    bulletinOnAir,
+    bulletinPlaybackStartedAt,
+    bulletinPlaybackDurationSeconds,
+    bulletinPlaybackRemainingSeconds: bulletinPlaybackActive()
+      ? Math.max(1, Math.ceil((bulletinPlaybackUntilMs - Date.now()) / 1000))
+      : 0,
     lastRunAt: config.lastRunAt,
     lastRunStatus: config.lastRunStatus,
     subwave,
