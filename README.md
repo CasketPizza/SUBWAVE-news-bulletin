@@ -1,5 +1,19 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.11 authentication and cache recovery
+
+- Serves the lightweight manager shell and its static assets without requiring
+  authentication, while keeping every API, upload, audio-preview, update and
+  rollback action protected by SUB/WAVE's admin Basic Auth.
+- Detects HTTP 401/403 responses and upstream HTML login pages, then shows a
+  clear **Re-authenticate** screen instead of leaving a blank or half-loaded UI.
+- Adds a protected `/reauth` navigation endpoint that reliably triggers the
+  browser's Basic-Auth prompt and returns to `/news-bulletin/` afterwards.
+- Adds a startup manager/authentication watchdog and a manual retry control.
+- Disables browser caching for all companion responses and versions `app.js` and
+  `styles.css` from the installed `VERSION`, preventing old assets from surviving
+  an update or reinstall.
+
 ## v0.5.10 stability fixes
 
 - Keeps only a small recent-actions log: at most 120 lines from a capped 128 KiB file.

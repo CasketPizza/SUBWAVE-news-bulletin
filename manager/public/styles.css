@@ -12,3 +12,7 @@ button:disabled{opacity:.55;cursor:wait}
 main{padding-bottom:140px}
 
 .log-actions{margin-top:0;justify-content:flex-end}.debug-toggle{margin:16px 0 10px}.debug-toggle small{color:#9d91a6}.log-actions button{white-space:nowrap}
+
+.auth-screen{position:fixed;inset:0;z-index:100;display:grid;place-items:center;padding:20px;background:rgba(9,7,13,.96);backdrop-filter:blur(14px)}
+.auth-card{width:min(560px,100%);padding:28px;border:1px solid #654c70;border-radius:18px;background:#18121d;box-shadow:0 24px 90px rgba(0,0,0,.65)}
+.auth-card h2{font-size:clamp(1.5rem,4vw,2.4rem);margin:.35rem 0 .8rem}.auth-card .actions{margin-top:22px}.auth-required main{filter:blur(4px);pointer-events:none;user-select:none}

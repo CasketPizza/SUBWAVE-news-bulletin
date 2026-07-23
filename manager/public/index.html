@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SUB/WAVE Hourly News</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=__APP_VERSION__">
 </head>
 <body>
   <main>
@@ -220,6 +220,18 @@
       <pre id="logs">Debug log paused. Click Refresh once or enable live debugging.</pre>
     </section>
   </main>
-  <script src="app.js"></script>
+  <section id="authRequired" class="auth-screen hidden" role="alertdialog" aria-modal="true" aria-labelledby="authTitle">
+    <div class="auth-card">
+      <p class="eyebrow">AUTHENTICATION REQUIRED</p>
+      <h2 id="authTitle">Your SUB/WAVE login needs refreshing</h2>
+      <p id="authMessage">The manager page is available, but the browser no longer has working admin credentials.</p>
+      <div class="actions">
+        <button id="reauthenticate" class="primary" type="button">Re-authenticate</button>
+        <button id="retryConnection" type="button">Retry connection</button>
+      </div>
+      <p class="field-help">Re-authenticate opens a protected manager endpoint so the browser can ask for the same username and password used by SUB/WAVE Admin.</p>
+    </div>
+  </section>
+  <script src="app.js?v=__APP_VERSION__"></script>
 </body>
 </html>

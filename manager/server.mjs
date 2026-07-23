@@ -37,6 +37,12 @@ const SUBWAVE_SECRETS = join(STATE_DIR, 'secrets.env');
 const GITHUB_REPO = process.env.GITHUB_REPO || 'CasketPizza/SUBWAVE-news-bulletin';
 const LIQUIDSOAP_HOST = process.env.LIQUIDSOAP_HOST || 'broadcast';
 const LIQUIDSOAP_PORT = Number(process.env.LIQUIDSOAP_PORT || 1234);
+const PUBLIC_DIR = join(import.meta.dirname, 'public');
+const INDEX_TEMPLATE_FILE = join(PUBLIC_DIR, 'index.html');
+let APP_VERSION = 'dev';
+try {
+  APP_VERSION = (await readFile(join(EXTENSION_DIR, 'VERSION'), 'utf8')).trim() || 'dev';
+} catch {}
 
 const LOG_MAX_BYTES = Math.min(1024 * 1024, Math.max(32 * 1024, Number(process.env.LOG_MAX_BYTES) || 128 * 1024));
 const LOG_TAIL_BYTES = Math.min(LOG_MAX_BYTES, Math.max(16 * 1024, Number(process.env.LOG_TAIL_BYTES) || 64 * 1024));
@@ -126,7 +132,23 @@ function requireAuth(req, res, next) {
   if (!ADMIN_USER && !ADMIN_PASS) return next();
   if (req.headers.authorization === authHeader()) return next();
   res.setHeader('WWW-Authenticate', 'Basic realm="SUB/WAVE Hourly News"');
+  res.setHeader('Cache-Control', 'no-store');
   return res.status(401).send('Authentication required');
+}
+
+function preventAdminCaching(_req, res, next) {
+  // The manager is an authenticated administration page that changes between
+  // releases. Never let a stale HTML/JS/auth response survive a reinstall or
+  // container recreation.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+}
+
+function renderedIndex() {
+  const template = fs.readFileSync(INDEX_TEMPLATE_FILE, 'utf8');
+  return template.replaceAll('__APP_VERSION__', encodeURIComponent(APP_VERSION));
 }
 
 async function loadJson(path, fallback) {
@@ -1711,10 +1733,34 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 const app = express();
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.disable('etag');
+app.use(preventAdminCaching);
+
+// Keep the shell and its static files public so an expired browser Basic-Auth
+// cache can display a useful re-authentication screen instead of a blank page.
+// Every API, upload, preview, update and rollback route remains protected below.
+app.get('/health', (_req, res) => res.json({ ok: true, version: APP_VERSION }));
+app.get(['/', '/index.html'], (_req, res) => {
+  res.type('html').send(renderedIndex());
+});
+app.use(express.static(PUBLIC_DIR, {
+  index: false,
+  etag: false,
+  lastModified: false,
+  maxAge: 0,
+}));
+
+// A top-level navigation to this protected endpoint reliably causes the browser
+// to show its Basic-Auth prompt. After successful authentication, return to the
+// manager page using a relative URL so the /news-bulletin/ proxy prefix survives.
+app.get('/reauth', requireAuth, (_req, res) => {
+  const stamp = Date.now();
+  res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Authenticated</title><script>location.replace(new URL('./?reauthenticated=${stamp}', location.href).href)</script>`);
+});
+
 app.use(requireAuth);
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(join(import.meta.dirname, 'public')));
+app.get('/api/auth-check', (_req, res) => res.json({ ok: true, version: APP_VERSION }));
 
 app.get('/api/settings', async (_req, res) => {
   const config = await settings();

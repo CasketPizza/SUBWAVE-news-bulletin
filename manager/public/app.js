@@ -13,6 +13,30 @@ let statusRequestPromise = null;
 const APP_BASE = new URL('.', window.location.href).pathname.replace(/\/$/, '');
 const localUrl = (path) => `${APP_BASE}${path.startsWith('/') ? path : `/${path}`}`;
 
+class AuthenticationRequiredError extends Error {
+  constructor(message = 'Authentication required') {
+    super(message);
+    this.name = 'AuthenticationRequiredError';
+  }
+}
+
+function showAuthenticationRequired(message = '') {
+  const panel = $('authRequired');
+  const text = $('authMessage');
+  if (text && message) text.textContent = message;
+  if (panel) panel.classList.remove('hidden');
+  document.body.classList.add('auth-required');
+}
+
+function hideAuthenticationRequired() {
+  $('authRequired')?.classList.add('hidden');
+  document.body.classList.remove('auth-required');
+}
+
+function beginReauthentication() {
+  window.location.assign(localUrl(`/reauth?cache=${Date.now()}`));
+}
+
 function notice(message, error = false) {
   const box = $('notice');
   box.textContent = message;
@@ -23,11 +47,43 @@ function notice(message, error = false) {
 }
 
 async function api(path, fetchOptions = {}) {
-  const response = await fetch(localUrl(path), fetchOptions);
+  const response = await fetch(localUrl(path), {
+    cache: 'no-store',
+    credentials: 'same-origin',
+    ...fetchOptions,
+    headers: {
+      ...(fetchOptions.headers || {}),
+      'Cache-Control': 'no-cache',
+    },
+  });
   const type = response.headers.get('content-type') || '';
   const body = type.includes('application/json') ? await response.json() : await response.text();
+
+  if (response.status === 401 || response.status === 403) {
+    showAuthenticationRequired('Your SUB/WAVE admin authentication is missing or no longer accepted. Re-authenticate to continue.');
+    throw new AuthenticationRequiredError();
+  }
+
+  // An upstream login/access gateway may answer an API request with a successful
+  // HTML page. Treat that as an authentication interruption instead of allowing
+  // the UI to fail later with a vague JavaScript error.
+  if (path.startsWith('/api/') && type.includes('text/html')) {
+    showAuthenticationRequired('The manager received a login page instead of API data. Re-authenticate to continue.');
+    throw new AuthenticationRequiredError('Login page returned instead of API data');
+  }
+
   if (!response.ok) throw new Error(body?.error || body || `${response.status}`);
   return body;
+}
+
+async function managerWatchdog() {
+  const healthResponse = await fetch(localUrl(`/health?cache=${Date.now()}`), {
+    cache: 'no-store',
+    credentials: 'same-origin',
+  });
+  if (!healthResponse.ok) throw new Error(`Manager health check returned HTTP ${healthResponse.status}`);
+  await api('/api/auth-check');
+  hideAuthenticationRequired();
 }
 
 function escapeHtml(value) {
@@ -428,11 +484,39 @@ $('liveLogs').onchange = () => {
   setLogAutoRefresh();
   if (!$('liveLogs').checked) notice('Live debugging paused.');
 };
+$('reauthenticate').onclick = beginReauthentication;
+$('retryConnection').onclick = async () => {
+  $('retryConnection').disabled = true;
+  try {
+    await managerWatchdog();
+    await load();
+  } catch (error) {
+    if (!(error instanceof AuthenticationRequiredError)) {
+      showAuthenticationRequired(`The manager could not be reached: ${error.message}`);
+    }
+  } finally {
+    $('retryConnection').disabled = false;
+  }
+};
 
 document.addEventListener('visibilitychange', setLogAutoRefresh);
 window.addEventListener('focus', setLogAutoRefresh);
 
-load().then(setLogAutoRefresh).catch((error) => notice(error.message, true));
+async function bootstrap() {
+  try {
+    await managerWatchdog();
+    await load();
+    setLogAutoRefresh();
+  } catch (error) {
+    if (error instanceof AuthenticationRequiredError) return;
+    showAuthenticationRequired(`The manager could not be reached: ${error.message}`);
+  }
+}
+
+bootstrap();
 setInterval(() => {
-  if (document.visibilityState === 'visible') loadStatus().catch(() => {});
+  if (document.visibilityState !== 'visible' || document.body.classList.contains('auth-required')) return;
+  loadStatus().catch((error) => {
+    if (!(error instanceof AuthenticationRequiredError)) notice(error.message, true);
+  });
 }, 30000);
