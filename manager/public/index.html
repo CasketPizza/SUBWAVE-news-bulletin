@@ -157,13 +157,14 @@
         </label>
       </div>
       <div class="grid two">
-        <label>Maximum spoken length
-          <div class="suffix compact"><input id="maxLengthSeconds" type="number" min="20" max="180"><span>seconds</span></div>
-        </label>
         <label>Clear pause between stories
           <div class="suffix compact"><input id="storyPauseSeconds" type="number" min="0.5" max="6" step="0.25"><span>seconds</span></div>
-          <small class="field-help">Real silence is inserted between separately rendered stories, making each headline unmistakably distinct.</small>
+          <small class="field-help">Real silence is inserted between separately rendered stories. There is no spoken-length cutoff: every complete story returned by the LLM is rendered and included.</small>
         </label>
+        <div class="length-policy">
+          <strong>Complete report playback</strong>
+          <p>The story count controls how many items are selected. The generated report is never shortened to a time target or silently truncated by the TTS preview limit.</p>
+        </div>
       </div>
     </section>
 
@@ -171,7 +172,7 @@
       <h2>Audio package</h2>
       <p class="hint">Choosing a file uploads and selects it immediately. The original file name is shown once conversion finishes.</p>
       <label class="toggle programme-toggle"><input id="interruptCurrentTrack" type="checkbox"> End the current song and air the bulletin as a standalone programme item</label>
-      <p class="hint">When enabled, SUB/WAVE skips the current song, moves any pending songs behind the complete intro/news/outro package, and starts the next queued or automatic song only after the package finishes. The handover into the intro uses SUB/WAVE’s normal skip transition. Disable this only to use ordinary foreground-voice ducking instead.</p>
+      <p class="hint">When enabled, SUB/WAVE skips the current song once, then airs one verified intro/news/outro file from beginning to end. The bulletin uses a zero-duration exit crossfade, so the next queued or automatic song starts only after the complete package reaches EOF. Disable this only to use ordinary foreground-voice ducking instead.</p>
       <div class="audio-grid">
         <article class="audio-card">
           <h3>Intro jingle</h3>

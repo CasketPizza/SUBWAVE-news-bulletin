@@ -51,6 +51,11 @@ const LOG_TAIL_BYTES = Math.min(LOG_MAX_BYTES, Math.max(16 * 1024, Number(proces
 const LOG_MAX_LINES = Math.min(500, Math.max(25, Number(process.env.LOG_MAX_LINES) || 120));
 const FFMPEG_TIMEOUT_MS = Math.min(10 * 60 * 1000, Math.max(30 * 1000, Number(process.env.FFMPEG_TIMEOUT_MS) || 3 * 60 * 1000));
 const FFPROBE_TIMEOUT_MS = Math.min(2 * 60 * 1000, Math.max(5 * 1000, Number(process.env.FFPROBE_TIMEOUT_MS) || 30 * 1000));
+// SUB/WAVE's admin TTS preview endpoint intentionally keeps only the first 200
+// input characters. The companion therefore renders longer on-air copy in
+// complete, bounded chunks below that ceiling and joins the audio back together.
+const TTS_PREVIEW_SAFE_CHARS = 180;
+const TTS_CHUNK_PAUSE_SECONDS = 0.10;
 
 const INTEREST_DEFAULTS = {
   profile: '',
@@ -72,7 +77,6 @@ const DEFAULTS = {
   maxItemsPerFeed: 8,
   maxCandidates: 12,
   maxHeadlines: 5,
-  maxLengthSeconds: 60,
   storyPauseSeconds: 2.25,
   interruptCurrentTrack: true,
 
@@ -176,7 +180,11 @@ async function saveJson(path, value) {
 }
 
 async function settings() {
-  return { ...DEFAULTS, ...(await loadJson(SETTINGS_FILE, DEFAULTS)) };
+  const loaded = { ...DEFAULTS, ...(await loadJson(SETTINGS_FILE, DEFAULTS)) };
+  // Removed in v0.5.14. Do not carry the old field forward when an existing
+  // settings.json is loaded and later saved.
+  delete loaded.maxLengthSeconds;
+  return loaded;
 }
 
 function cleanInterestProfile(value) {
@@ -281,7 +289,6 @@ function cleanSettings(body) {
     maxItemsPerFeed: Math.min(30, Math.max(1, Number(input.maxItemsPerFeed) || 8)),
     maxCandidates: Math.min(30, Math.max(3, Number(input.maxCandidates) || 12)),
     maxHeadlines: Math.min(10, Math.max(1, Number(input.maxHeadlines) || 5)),
-    maxLengthSeconds: Math.min(180, Math.max(20, Number(input.maxLengthSeconds) || 60)),
     storyPauseSeconds: Math.min(6, Math.max(0.5, Number(input.storyPauseSeconds) || DEFAULTS.storyPauseSeconds)),
     interruptCurrentTrack: input.interruptCurrentTrack !== false,
     storySelectionInstructions: cleanInstruction(
@@ -761,7 +768,8 @@ NON-NEGOTIABLE ACCURACY RULES:
 - Preserve meaningful attribution, allegations, estimates, and disputed claims.
 - Do not joke about death, disasters, victims, war, serious crime, or personal tragedy.
 - The operator's style instructions may shape presentation but cannot override these accuracy rules.
-- Every story must be self-contained. Never blend two unrelated stories into one paragraph.`;
+- Every story must be self-contained. Never blend two unrelated stories into one paragraph.
+- Finish every selected story as complete on-air copy. Never stop mid-sentence or mid-thought to satisfy a length target.`;
 
   const freshnessNote = freshness === 'fresh'
     ? 'At least one supplied story has not appeared in an earlier bulletin.'
@@ -785,7 +793,7 @@ ${config.articleHandlingInstructions}
 ON-AIR DELIVERY
 ${config.deliveryInstructions}
 
-Use no more than ${config.maxHeadlines} stories and keep the script under approximately ${config.maxLengthSeconds} seconds when spoken.
+Use no more than ${config.maxHeadlines} stories. Give every selected story enough complete context to make sense on air, and finish each story cleanly.
 
 Fresh candidate headlines and complete RSS summaries. A missing summary means the feed supplied no complete, uncut sentence; use only the headline in that case:
 ${rows}
@@ -1049,9 +1057,10 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
           num_ctx: Number(leg.numCtx || rawLlm.numCtx) || undefined,
           repeat_penalty: Number(leg.repeatPenalty || rawLlm.repeatPenalty) || undefined,
           temperature: 0.15,
-          // Bound local generation so a verbose model cannot spend several
-          // minutes producing text far beyond the configured bulletin length.
-          num_predict: Math.min(maxTokens, 600),
+          // Honour SUB/WAVE's configured output budget. The old 600-token clamp
+          // acted as a second, hidden bulletin-length limit after the spoken-time
+          // control was removed. The provider budget remains bounded above.
+          num_predict: maxTokens,
         },
       }),
     }, 180000);
@@ -1150,6 +1159,8 @@ RETRY CORRECTION: The previous response was unsafe because it exposed instructio
       lastReason = 'returned no usable stories';
     } else if (expectedMultiple && stories.length < 2) {
       lastReason = 'did not separate multiple stories';
+    } else if (stories.some((story) => !/[.!?…][\s\"'”’)]*$/.test(story.trim()))) {
+      lastReason = 'ended a story without completing its final sentence';
     } else {
       const leak = unsafeOutputReason(stories, config, interestProfile);
       if (!leak) return { text: stories.join(' '), stories };
@@ -1399,6 +1410,94 @@ function resolveVoice(snapshot, config, presenter = resolvePresenter(snapshot, c
   };
 }
 
+function speechBoundary(text, maxChars = TTS_PREVIEW_SAFE_CHARS) {
+  const window = text.slice(0, maxChars + 1);
+  const minimum = Math.min(72, Math.floor(maxChars * 0.4));
+  const patterns = [
+    /[.!?…][\"'”’)]?(?=\s|$)/g,
+    /[;:](?=\s|$)/g,
+    /[,—–](?=\s|$)/g,
+  ];
+  for (const pattern of patterns) {
+    let match;
+    let best = -1;
+    while ((match = pattern.exec(window)) !== null) {
+      const end = match.index + match[0].length;
+      if (end >= minimum && end <= maxChars) best = end;
+    }
+    if (best > 0) return best;
+  }
+  const space = window.lastIndexOf(' ', maxChars);
+  return space >= minimum ? space : Math.min(maxChars, text.length);
+}
+
+function splitTextForTtsPreview(value, maxChars = TTS_PREVIEW_SAFE_CHARS) {
+  let remaining = String(value || '').replace(/\s+/g, ' ').trim();
+  const chunks = [];
+  while (remaining.length > maxChars) {
+    const cut = speechBoundary(remaining, maxChars);
+    const chunk = remaining.slice(0, cut).trim();
+    if (!chunk) throw new Error('Could not split bulletin text safely for TTS.');
+    chunks.push(chunk);
+    remaining = remaining.slice(cut).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  if (!chunks.length) throw new Error('No text was available for TTS.');
+  if (chunks.some((chunk) => chunk.length > maxChars)) {
+    throw new Error(`A TTS chunk exceeded the safe ${maxChars}-character limit.`);
+  }
+  return chunks;
+}
+
+let generatedSequence = 0;
+function generatedPath(prefix, extension = 'wav') {
+  generatedSequence = (generatedSequence + 1) % 1_000_000;
+  return join(GENERATED_DIR, `${prefix}-${Date.now()}-${process.pid}-${generatedSequence}.${extension}`);
+}
+
+function normalizeAudio(inputPath, prefix) {
+  const out = generatedPath(prefix);
+  run('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-i', inputPath, '-ar', '44100', '-ac', '2',
+    '-c:a', 'pcm_s16le', out,
+  ]);
+  return out;
+}
+
+async function concatenateAudio(paths, prefix, pauseSeconds = 0) {
+  if (!paths.length) throw new Error('No audio clips were supplied for concatenation.');
+  const normalized = paths.map((path, index) => normalizeAudio(path, `${prefix}-part-${index + 1}`));
+  if (normalized.length === 1) return normalized[0];
+
+  let silence = null;
+  if (pauseSeconds > 0) {
+    silence = generatedPath(`${prefix}-pause`);
+    run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+      '-t', Number(pauseSeconds).toFixed(3),
+      '-c:a', 'pcm_s16le', silence,
+    ]);
+  }
+
+  const sequence = [];
+  normalized.forEach((path, index) => {
+    sequence.push(path);
+    if (silence && index < normalized.length - 1) sequence.push(silence);
+  });
+  const listPath = generatedPath(`${prefix}-concat`, 'txt');
+  const escaped = sequence.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n');
+  await writeFile(listPath, `${escaped}\n`);
+  const out = generatedPath(prefix);
+  run('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'concat', '-safe', '0', '-i', listPath,
+    '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', out,
+  ]);
+  return out;
+}
+
 async function synthesizeVoice(snapshot, config, presenter, text) {
   const voice = resolveVoice(snapshot, config, presenter);
   const response = await controllerRequest('/settings/tts/preview', {
@@ -1408,49 +1507,38 @@ async function synthesizeVoice(snapshot, config, presenter, text) {
   });
   const contentType = response.headers.get('content-type') || '';
   const ext = contentType.includes('mpeg') || contentType.includes('mp3') ? 'mp3' : 'wav';
-  const path = join(GENERATED_DIR, `voice-${Date.now()}.${ext}`);
+  const path = generatedPath('voice', ext);
   await writeFile(path, Buffer.from(await response.arrayBuffer()));
   return { path, voice };
 }
 
+async function synthesizeCompleteStory(snapshot, config, presenter, story, storyIndex) {
+  const chunks = splitTextForTtsPreview(story);
+  if (chunks.length > 1) {
+    await log(`TTS story ${storyIndex + 1} contains ${story.length} characters; rendering all of it in ${chunks.length} safe chunks because SUB/WAVE's preview endpoint keeps only 200 characters per request.`);
+  }
+  const paths = [];
+  let resolvedVoice = null;
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+    const chunk = chunks[chunkIndex];
+    // A punctuation-only continuation cue improves prosody when an unusually long
+    // sentence had to be divided at a word boundary. It does not add spoken copy.
+    const text = chunkIndex < chunks.length - 1 && !/[.!?…,:;—–\"'”’)]$/.test(chunk)
+      ? `${chunk},`
+      : chunk;
+    const speech = await synthesizeVoice(snapshot, config, presenter, text);
+    const seconds = durationOf(speech.path);
+    if (seconds < 0.1) throw new Error(`TTS returned an empty clip for story ${storyIndex + 1}, chunk ${chunkIndex + 1}.`);
+    paths.push(speech.path);
+    resolvedVoice ||= speech.voice;
+  }
+  const path = await concatenateAudio(paths, `spoken-story-${storyIndex + 1}`, TTS_CHUNK_PAUSE_SECONDS);
+  return { path, voice: resolvedVoice, chunks: chunks.length, duration: durationOf(path) };
+}
+
 async function makeNarrationAudio(config, speechPaths) {
   if (!speechPaths.length) throw new Error('No speech clips were generated.');
-  const normalized = [];
-  for (let index = 0; index < speechPaths.length; index++) {
-    const out = join(GENERATED_DIR, `story-${Date.now()}-${index}.wav`);
-    run('ffmpeg', [
-      '-hide_banner', '-loglevel', 'error', '-y',
-      '-i', speechPaths[index], '-ar', '44100', '-ac', '2',
-      '-c:a', 'pcm_s16le', out,
-    ]);
-    normalized.push(out);
-  }
-
-  if (normalized.length === 1) return normalized[0];
-
-  const silence = join(GENERATED_DIR, `story-pause-${Date.now()}.wav`);
-  run('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error', '-y',
-    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-    '-t', Number(config.storyPauseSeconds).toFixed(3),
-    '-c:a', 'pcm_s16le', silence,
-  ]);
-
-  const sequence = [];
-  normalized.forEach((path, index) => {
-    sequence.push(path);
-    if (index < normalized.length - 1) sequence.push(silence);
-  });
-  const listPath = join(GENERATED_DIR, `narration-${Date.now()}.txt`);
-  const escaped = sequence.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n');
-  await writeFile(listPath, `${escaped}\n`);
-  const out = join(GENERATED_DIR, `narration-${Date.now()}.wav`);
-  run('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error', '-y',
-    '-f', 'concat', '-safe', '0', '-i', listPath,
-    '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', out,
-  ]);
-  return out;
+  return concatenateAudio(speechPaths, 'narration', speechPaths.length > 1 ? config.storyPauseSeconds : 0);
 }
 
 function run(command, args, options = {}) {
@@ -1520,10 +1608,10 @@ async function makeFullPackage(bulletinPath) {
   parts.push(bulletinPath);
   if (existsSync(outro)) parts.push(outro);
 
-  // Keep a short silent tail inside the programme item. Liquidsoap begins its
-  // tiny exit crossfade during this tail, so the next song cannot overlap the
-  // final spoken word or the audible end of the outro.
-  const tail = join(GENERATED_DIR, `package-tail-${Date.now()}.wav`);
+  // The bulletin itself now exits with a zero-duration Liquidsoap crossfade.
+  // Keep a short silent tail inside the programme item as decoder-safe padding;
+  // the following song cannot overlap or consume any spoken audio.
+  const tail = generatedPath('package-tail');
   run('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
@@ -1531,7 +1619,8 @@ async function makeFullPackage(bulletinPath) {
   ]);
   parts.push(tail);
 
-  const out = join(GENERATED_DIR, `news-package-${Date.now()}.wav`);
+  const expectedDuration = parts.reduce((total, path) => total + durationOf(path), 0);
+  const out = generatedPath('news-package');
   const inputs = parts.flatMap((path) => ['-i', path]);
   const labels = parts.map((_, index) => `[${index}:a]`).join('');
   run('ffmpeg', [
@@ -1540,7 +1629,11 @@ async function makeFullPackage(bulletinPath) {
     '-filter_complex', `${labels}concat=n=${parts.length}:v=0:a=1[out]`,
     '-map', '[out]', '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', out,
   ]);
-  return out;
+  const duration = durationOf(out);
+  if (duration + 0.15 < expectedDuration) {
+    throw new Error(`Final bulletin package is incomplete (${duration.toFixed(2)}s rendered; expected at least ${expectedDuration.toFixed(2)}s).`);
+  }
+  return { path: out, duration };
 }
 
 function liquidsoapCommand(command, timeoutMs = 3500) {
@@ -1731,9 +1824,9 @@ async function waitForBulletinNowPlaying(notBeforeMs, timeoutMs = 20000) {
   throw new Error(`The bulletin was prepared, but SUB/WAVE still reported ${description} after one safe skip. No additional songs were skipped.`);
 }
 
-async function queueAsProgrammeItem(packagePath) {
+async function queueAsProgrammeItem(packagePath, packageDuration) {
   const pending = await captureAndClearPendingQueue();
-  const bulletinUri = `annotate:title="${annotateValue('Hourly News Bulletin')}",artist="${annotateValue('SUB/WAVE News')}",liq_cross_duration="0.25":${packagePath}`;
+  const bulletinUri = `annotate:title="${annotateValue('Hourly News Bulletin')}",artist="${annotateValue('SUB/WAVE News')}",liq_cross_duration="0.0":${packagePath}`;
   let restored = 0;
   let bulletinRid = '';
   let childRid = '';
@@ -1762,7 +1855,7 @@ async function queueAsProgrammeItem(packagePath) {
     const skipAt = Date.now();
     await controllerRequest('/dj/skip', { method: 'POST' });
     await waitForBulletinNowPlaying(skipAt, 20000);
-    await log(`Bulletin playable RID ${childRid} confirmed on air after one safe handover skip.`);
+    await log(`Bulletin playable RID ${childRid} confirmed on air after one safe handover skip. The ${Number(packageDuration).toFixed(2)}s package will now play to EOF with a zero-duration exit crossfade before music resumes.`);
     return { movedPending: pending.length, bulletinRid, childRid, skipCount: 1 };
   } catch (error) {
     for (const uri of pending.slice(restored)) {
@@ -1812,19 +1905,24 @@ async function runBulletin(reason = 'manual') {
     await log(`Bulletin script ready (${generated.stories.length} stories). Starting TTS.`);
     const speechPaths = [];
     let resolvedSpeech = null;
+    let renderedChunks = 0;
     for (let storyIndex = 0; storyIndex < generated.stories.length; storyIndex++) {
       const story = generated.stories[storyIndex];
-      await log(`Rendering TTS story ${storyIndex + 1}/${generated.stories.length}.`);
-      const speech = await synthesizeVoice(snapshot, config, presenter, story);
+      await log(`Rendering complete TTS story ${storyIndex + 1}/${generated.stories.length}.`);
+      const speech = await synthesizeCompleteStory(snapshot, config, presenter, story, storyIndex);
       speechPaths.push(speech.path);
+      renderedChunks += speech.chunks;
       resolvedSpeech ||= speech;
+      await log(`TTS story ${storyIndex + 1}/${generated.stories.length} complete (${speech.chunks} chunk${speech.chunks === 1 ? '' : 's'}; ${speech.duration.toFixed(2)}s).`);
     }
     const narration = await makeNarrationAudio(config, speechPaths);
     const bulletin = await makeBulletinAudio(config, narration);
-    const packagePath = await makeFullPackage(bulletin);
+    const packageInfo = await makeFullPackage(bulletin);
+    const packagePath = packageInfo.path;
+    await log(`Verified complete intro/news/outro package (${packageInfo.duration.toFixed(2)}s; ${generated.stories.length} stories; ${renderedChunks} TTS chunks).`);
     let playback;
     if (config.interruptCurrentTrack) {
-      playback = await queueAsProgrammeItem(packagePath);
+      playback = await queueAsProgrammeItem(packagePath, packageInfo.duration);
     } else {
       await queueAudio(packagePath);
       playback = { movedPending: 0 };
@@ -1844,7 +1942,7 @@ async function runBulletin(reason = 'manual') {
       lastRunStatus: 'ok',
     };
     await saveJson(SETTINGS_FILE, latest);
-    await log(`Bulletin queued (${freshness}; ${generated.stories.length} stories; ${config.storyPauseSeconds}s story gaps; ${config.interruptCurrentTrack ? 'programme-item handover' : 'foreground voice'}; moved ${playback.movedPending} pending tracks) with presenter ${presenter?.name || 'unknown'} using ${generated.provider}/${generated.model}, ${resolvedSpeech.voice.engine}/${resolvedSpeech.voice.voice || 'default'}: ${generated.text}`);
+    await log(`Bulletin queued in full (${freshness}; ${generated.stories.length} stories; ${renderedChunks} TTS chunks; ${packageInfo.duration.toFixed(2)}s package; ${config.storyPauseSeconds}s story gaps; ${config.interruptCurrentTrack ? 'programme-item handover with zero-duration exit crossfade' : 'foreground voice'}; moved ${playback.movedPending} pending tracks) with presenter ${presenter?.name || 'unknown'} using ${generated.provider}/${generated.model}, ${resolvedSpeech.voice.engine}/${resolvedSpeech.voice.voice || 'default'}: ${generated.text}`);
     return {
       ok: true,
       spoken: generated.text,
@@ -1852,6 +1950,8 @@ async function runBulletin(reason = 'manual') {
       storyCount: generated.stories.length,
       storyPauseSeconds: config.storyPauseSeconds,
       interruptedTrack: config.interruptCurrentTrack,
+      packageDurationSeconds: packageInfo.duration,
+      ttsChunkCount: renderedChunks,
     };
   } catch (error) {
     const latest = {
@@ -1865,14 +1965,14 @@ async function runBulletin(reason = 'manual') {
   } finally {
     runBusy = false;
     try {
-      // Keep the newest generated audio by modification time, not by filename.
+      // Keep the newest generated artefacts by modification time, not by filename.
       // Different prefixes (story-, silence-, narration-, news-package-) do not
       // sort chronologically. The old lexical cleanup could delete the brand-new
       // news-package immediately after queueing it, before Liquidsoap opened the
       // resolved child request, producing a "Nonexistent file" race on air.
       const generated = await Promise.all(
         (await readdir(GENERATED_DIR))
-          .filter((name) => /\.(wav|mp3)$/i.test(name))
+          .filter((name) => /\.(wav|mp3|txt)$/i.test(name))
           .map(async (name) => {
             const path = join(GENERATED_DIR, name);
             const info = await stat(path);
@@ -1880,7 +1980,7 @@ async function runBulletin(reason = 'manual') {
           }),
       );
       generated.sort((a, b) => b.mtimeMs - a.mtimeMs);
-      await Promise.all(generated.slice(24).map((item) => rm(item.path, { force: true })));
+      await Promise.all(generated.slice(32).map((item) => rm(item.path, { force: true })));
     } catch {}
   }
 }

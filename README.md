@@ -1,5 +1,24 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.14 complete-report TTS and playout
+
+- Removes the **Maximum spoken length** setting and its prompt-level time target.
+  The story-count control remains, but every story the LLM returns must finish as
+  complete on-air copy.
+- Fixes the persistent mid-story cutoff caused by SUB/WAVE's admin TTS preview
+  endpoint accepting arbitrary text while internally retaining only its first 200
+  characters. Long stories are now split at sentence or phrase boundaries into
+  safe chunks, rendered completely, and rejoined before the normal inter-story
+  pauses are added.
+- Removes the companion's hidden 600-token Ollama clamp and instead honours the
+  configured, still-bounded SUB/WAVE output-token budget.
+- Verifies every generated TTS clip and the duration of the final combined
+  intro/news/outro WAV before it can be queued. Diagnostics report story, chunk
+  and final-package durations.
+- Marks the bulletin programme item with a zero-duration exit crossfade. Music
+  resumes only when the single verified package reaches EOF, preventing the next
+  song from consuming the end of the report.
+
 ## v0.5.13 progressive interest examples
 
 - Shows the interest tuner in batches of 16 articles instead of rendering the

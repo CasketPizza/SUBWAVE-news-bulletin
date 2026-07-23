@@ -218,7 +218,7 @@ async function load() {
   model.feeds.forEach(feedRow);
   [
     'enabled', 'customMinute', 'timeZone', 'maxItemsPerFeed', 'maxCandidates',
-    'maxHeadlines', 'maxLengthSeconds', 'storyPauseSeconds', 'interruptCurrentTrack', 'storySelectionInstructions',
+    'maxHeadlines', 'storyPauseSeconds', 'interruptCurrentTrack', 'storySelectionInstructions',
     'articleHandlingInstructions', 'deliveryInstructions', 'voiceMode',
     'voiceName', 'voiceSpeed', 'voiceLanguage', 'bedVolumeDb', 'bedFadeIn',
     'bedFadeOut', 'loopBed',
@@ -252,7 +252,6 @@ function collect() {
     maxItemsPerFeed: Number($('maxItemsPerFeed').value),
     maxCandidates: Number($('maxCandidates').value),
     maxHeadlines: Number($('maxHeadlines').value),
-    maxLengthSeconds: Number($('maxLengthSeconds').value),
     storyPauseSeconds: Number($('storyPauseSeconds').value),
     interruptCurrentTrack: $('interruptCurrentTrack').checked,
     storySelectionInstructions: $('storySelectionInstructions').value,
