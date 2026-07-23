@@ -1,23 +1,29 @@
 # SUB/WAVE Hourly News Bulletin
 
-## v0.5.12 audience-interest tuning
+## v0.5.13 progressive interest examples
 
-- Adds a **Tune news interests** popup that loads up to 60 recent items from the
-  configured RSS and Atom sources, with source, search and rating filters.
-- Lets the operator mark examples as **More like this**, **Less like this**, or
-  neutral. These examples never force a particular article into a bulletin.
-- Uses SUB/WAVE's configured primary LLM, with fallback support, to turn the
-  examples into a short editable audience-interest profile. The profile is a
-  soft tie-breaker only: consequence, freshness, major local/world importance,
-  and avoiding repetition remain higher priorities.
-- Stores at most 50 positive and 50 negative examples, while using only the most
-  recent 25 of each when regenerating the compact profile.
-- Gives both the interest-profile generator and bulletin writer clean RSS/Atom
-  summaries for context. It prefers richer feed content where available and
-  keeps only complete sentences; incomplete teaser fragments and mid-sentence
-  truncation are omitted rather than handed to the LLM or displayed as fact.
-- Adds manual profile editing, article refresh, profile reset, saved-example
-  counts, and cached article-browser fallback when every live feed is unavailable.
+- Shows the interest tuner in batches of 16 articles instead of rendering the
+  entire feed pool at once.
+- Adds a **Load more** control at the true bottom of the scrollable article list,
+  including a visible count of how many matching articles are currently shown.
+- Preserves the operator's scroll position and article ratings while more
+  examples are revealed.
+- Resets to the first batch when search, source, or rating filters change so a
+  filtered result never opens halfway through its list.
+- Expands the interest-browser pool to as many as 120 deduplicated articles while
+  retaining four-feed concurrency and fetching the pool only when the tuner is
+  opened or manually refreshed.
+
+## v0.5.12 audience interest tuning
+
+- Adds a **Tune news interests** popup with More like this, Less like this and
+  Neutral ratings for recent articles from the configured feeds.
+- Generates a concise, editable audience-interest profile through SUB/WAVE's
+  configured LLM and uses it only as a soft story-selection tie-breaker.
+- Retains bounded positive and negative examples without treating any clicked
+  article as a request to air that particular story.
+- Supplies complete RSS/Atom summaries where available and omits incomplete
+  teaser fragments rather than feeding the model text cut off mid-sentence.
 
 ## v0.5.11 authentication and cache recovery
 
@@ -120,8 +126,6 @@ replacing any SUB/WAVE application files.
   configured TTS engine, voice, speed, provider, and language
 - Provides separate editable newsroom instructions for story selection,
   source-material handling, and on-air delivery
-- Builds an editable soft audience-interest profile from operator-rated recent
-  articles without forcing any particular example into a bulletin
 - Uploads an intro jingle, a background news bed, and an outro jingle
 - Mixes the voice over the background bed with adjustable level and fades
 - Inserts a configurable, real silence gap between separately rendered stories
@@ -130,10 +134,12 @@ replacing any SUB/WAVE application files.
 - Ends the current song, inserts the complete bulletin as the next main programme
   item, preserves pending song order, and starts the following song after the outro
 - Provides a web UI for settings, uploads, run-now testing, updates, and rollback
+- Includes progressive audience-interest tuning with recent feed examples and a
+  Load more control for deeper preference training
 
 ## Newsroom controls
 
-The manager page includes three prompt fields similar to a SUB/WAVE skill brief, plus an optional audience-interest profile:
+The manager page includes three prompt fields similar to a SUB/WAVE skill brief:
 
 1. **Story selection instructions** — what deserves inclusion, regional and
    topical priorities, and what to avoid.

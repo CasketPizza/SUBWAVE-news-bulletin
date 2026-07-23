@@ -11,6 +11,8 @@ let interestModel = { profile: '', likes: [], dislikes: [], likeCount: 0, dislik
 let interestArticles = [];
 let interestRatings = new Map();
 let interestArticlesLoaded = false;
+const INTEREST_PAGE_SIZE = 16;
+let interestVisibleLimit = INTEREST_PAGE_SIZE;
 
 // The manager is normally reverse-proxied below /news-bulletin/. Resolve every
 // request relative to the page so the same build also works directly at /.
@@ -315,18 +317,20 @@ function updateInterestCounts() {
   $('interestSelectionCount').textContent = `${likes} preferred · ${dislikes} de-emphasised`;
 }
 
-function renderInterestArticles() {
+function renderInterestArticles({ preserveScroll = true } = {}) {
   const list = $('interestArticles');
+  const previousScrollTop = preserveScroll ? list.scrollTop : 0;
   const query = $('interestSearch').value.trim().toLowerCase();
   const source = $('interestSourceFilter').value;
   const ratingFilter = $('interestRatingFilter').value;
-  const shown = interestArticles.filter((article) => {
+  const matching = interestArticles.filter((article) => {
     const rating = ratingFor(article.key);
     const haystack = `${article.title || ''} ${article.summary || article.description || ''}`.toLowerCase();
     return (!source || article.source === source)
       && (!ratingFilter || rating === ratingFilter)
       && (!query || haystack.includes(query));
   });
+  const shown = matching.slice(0, interestVisibleLimit);
 
   list.innerHTML = '';
   if (!shown.length) {
@@ -334,6 +338,7 @@ function renderInterestArticles() {
     empty.className = 'empty-state';
     empty.textContent = interestArticles.length ? 'No articles match the current filters.' : 'No articles are available.';
     list.appendChild(empty);
+    list.scrollTop = 0;
     updateInterestCounts();
     return;
   }
@@ -358,13 +363,34 @@ function renderInterestArticles() {
     list.appendChild(card);
   }
 
+  if (shown.length < matching.length) {
+    const remaining = matching.length - shown.length;
+    const nextCount = Math.min(INTEREST_PAGE_SIZE, remaining);
+    const more = document.createElement('div');
+    more.className = 'interest-load-more';
+    more.innerHTML = `
+      <span>Showing ${shown.length} of ${matching.length} matching articles</span>
+      <button type="button" id="loadMoreInterestArticles">Load ${nextCount} more</button>`;
+    list.appendChild(more);
+    more.querySelector('button').onclick = () => {
+      interestVisibleLimit += INTEREST_PAGE_SIZE;
+      renderInterestArticles({ preserveScroll: true });
+    };
+  }
+
   list.querySelectorAll('[data-interest-rating]').forEach((button) => {
     button.onclick = () => {
       interestRatings.set(button.dataset.interestKey, button.dataset.interestRating);
-      renderInterestArticles();
+      renderInterestArticles({ preserveScroll: true });
     };
   });
+  list.scrollTop = previousScrollTop;
   updateInterestCounts();
+}
+
+function resetInterestPagination() {
+  interestVisibleLimit = INTEREST_PAGE_SIZE;
+  renderInterestArticles({ preserveScroll: false });
 }
 
 function populateInterestSources() {
@@ -396,12 +422,13 @@ async function loadInterestArticles(force = false) {
       if (pendingRatings.has(article.key)) interestRatings.set(article.key, pendingRatings.get(article.key));
     }
     interestArticlesLoaded = true;
+    interestVisibleLimit = INTEREST_PAGE_SIZE;
     populateInterestSources();
     $('interestArticleFreshness').textContent = payload.cached
       ? `Cached feed results${payload.updatedAt ? ` from ${articleDate(payload.updatedAt)}` : ''}`
       : `Updated ${payload.updatedAt ? articleDate(payload.updatedAt) : 'now'}`;
     setInterestStatus(`${interestArticles.length} recent articles loaded. Rate broad examples, then generate the profile once.`);
-    renderInterestArticles();
+    renderInterestArticles({ preserveScroll: false });
   } catch (error) {
     setInterestStatus(error.message, true);
     $('interestArticles').innerHTML = '<p class="empty-state">Articles could not be loaded. Check Recent actions for feed errors.</p>';
@@ -641,9 +668,9 @@ $('tuneInterests').onclick = () => openInterestTuner().catch((error) => setInter
 $('closeInterests').onclick = closeInterestTuner;
 $('closeInterestsTop').onclick = closeInterestTuner;
 $('refreshInterestArticles').onclick = () => loadInterestArticles(true);
-$('interestSearch').oninput = renderInterestArticles;
-$('interestSourceFilter').onchange = renderInterestArticles;
-$('interestRatingFilter').onchange = renderInterestArticles;
+$('interestSearch').oninput = resetInterestPagination;
+$('interestSourceFilter').onchange = resetInterestPagination;
+$('interestRatingFilter').onchange = resetInterestPagination;
 $('generateInterestProfile').onclick = generateInterestProfileFromChoices;
 $('saveInterestProfile').onclick = saveEditedInterestProfile;
 $('resetInterests').onclick = resetAllInterests;

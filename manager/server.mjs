@@ -589,7 +589,10 @@ async function settleWithConcurrency(items, limit, worker) {
 }
 
 async function collectInterestArticles(config) {
-  const perFeed = Math.min(20, Math.max(8, Number(config.maxItemsPerFeed) || 8));
+  // Keep a deeper pool than the normal bulletin candidate list so the tuner can
+  // reveal more examples in small batches without refetching every time the
+  // operator reaches the bottom of the popup.
+  const perFeed = Math.min(30, Math.max(16, (Number(config.maxItemsPerFeed) || 8) * 2));
   // The preference browser is interactive rather than time-critical. Limit feed
   // concurrency so opening the popup cannot cause a network/CPU burst on a
   // small SUB/WAVE VM when many sources are configured.
@@ -603,7 +606,7 @@ async function collectInterestArticles(config) {
   });
 
   if (buckets.length) {
-    const items = mergeHeadlineBuckets(buckets, 60);
+    const items = mergeHeadlineBuckets(buckets, 120);
     const payload = { items, updatedAt: new Date().toISOString(), cached: false };
     await saveJson(INTEREST_ARTICLES_CACHE_FILE, payload).catch(() => {});
     return payload;
@@ -611,7 +614,7 @@ async function collectInterestArticles(config) {
 
   const cached = await loadJson(INTEREST_ARTICLES_CACHE_FILE, { items: [], updatedAt: null });
   const items = Array.isArray(cached.items)
-    ? cached.items.map(normaliseArticleItem).filter((item) => item.title).slice(0, 60)
+    ? cached.items.map(normaliseArticleItem).filter((item) => item.title).slice(0, 120)
     : [];
   if (!items.length) throw new Error('The configured feeds returned no articles and no interest-browser cache is available.');
   return { items, updatedAt: cached.updatedAt || null, cached: true };
