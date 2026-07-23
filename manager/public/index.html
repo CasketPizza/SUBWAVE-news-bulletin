@@ -152,7 +152,7 @@
         <label>Candidate pool
           <input id="maxCandidates" type="number" min="3" max="30">
         </label>
-        <label>Stories read
+        <label>Stories per bulletin
           <input id="maxHeadlines" type="number" min="1" max="10">
         </label>
       </div>
@@ -163,7 +163,7 @@
         </label>
         <div class="length-policy">
           <strong>Complete report playback</strong>
-          <p>The story count controls how many items are selected. The generated report is never shortened to a time target or silently truncated by the TTS preview limit.</p>
+          <p>The story count is an exact target whenever the current feeds contain enough candidates. Fresh items are prioritised, then current previously seen items fill any remaining places. The generated report is never shortened to a time target or silently truncated by the TTS preview limit.</p>
         </div>
       </div>
     </section>

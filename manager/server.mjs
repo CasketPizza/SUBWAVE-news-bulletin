@@ -505,7 +505,7 @@ async function fetchFeed(feed, maxItems) {
     const response = await fetch(feed.url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'SUBWAVE-News-Bulletin/0.5.12 (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)',
+        'User-Agent': `SUBWAVE-News-Bulletin/${APP_VERSION} (+https://github.com/CasketPizza/SUBWAVE-news-bulletin)`,
       },
     });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -568,15 +568,34 @@ async function collectHeadlines(config) {
   const seenLedger = await loadJson(SEEN_FILE, { keys: [] });
   const old = new Set(Array.isArray(seenLedger.keys) ? seenLedger.keys : []);
   const fresh = current.filter((item) => !old.has(item.key));
+  const previouslySeen = current.filter((item) => old.has(item.key));
+
+  // "Stories per bulletin" is a requested count, not merely an upper bound.
+  // Always provide the LLM enough candidates to satisfy it when the current feed
+  // contains enough items. Fresh stories lead; current previously-seen stories
+  // then fill the pool. The old behaviour passed ONLY the fresh subset whenever
+  // even one unseen item existed, so a feed with two new entries could produce
+  // only two spoken stories despite an operator setting of six.
+  const candidateLimit = Math.min(
+    current.length,
+    Math.max(Number(config.maxCandidates) || 0, Number(config.maxHeadlines) || 1),
+  );
   let candidates;
   if (fresh.length) {
-    candidates = fresh.slice(0, config.maxCandidates);
+    candidates = [...fresh, ...previouslySeen].slice(0, candidateLimit);
   } else {
-    candidates = current.slice(0, config.maxCandidates);
+    candidates = current.slice(0, candidateLimit);
     if (freshness !== 'cached') freshness = 'recap';
   }
 
-  return { candidates, ledger: old, freshness };
+  return {
+    candidates,
+    ledger: old,
+    freshness,
+    freshCount: fresh.length,
+    availableCount: current.length,
+    targetStoryCount: Math.min(Number(config.maxHeadlines) || 1, candidates.length),
+  };
 }
 
 async function settleWithConcurrency(items, limit, worker) {
@@ -741,6 +760,7 @@ function toneLine(label, value) {
 
 function buildPrompts(snapshot, config, candidates, presenter, freshness = 'fresh', interestProfile = '') {
   const values = snapshot.values || {};
+  const targetStoryCount = Math.max(1, Math.min(Number(config.maxHeadlines) || 1, candidates.length));
   const station = values.station || 'SUB/WAVE';
   const presenterLanguage = config.voiceMode === 'override' && config.voiceLanguage
     ? config.voiceLanguage
@@ -794,7 +814,7 @@ ${config.articleHandlingInstructions}
 ON-AIR DELIVERY
 ${config.deliveryInstructions}
 
-Use no more than ${config.maxHeadlines} stories. Give every selected story enough complete context to make sense on air, and finish each story cleanly.
+Select and write exactly ${targetStoryCount} distinct ${targetStoryCount === 1 ? 'story' : 'stories'} from the supplied candidates. The operator requested ${config.maxHeadlines}; ${targetStoryCount === Number(config.maxHeadlines) ? 'enough candidates are available, so this count is mandatory' : `only ${candidates.length} candidate${candidates.length === 1 ? ' is' : 's are'} available, so use all available candidates`}. Give every story enough complete context to make sense on air, and finish each story cleanly.
 
 Fresh candidate headlines and complete RSS summaries. A missing summary means the feed supplied no complete, uncut sentence; use only the headline in that case:
 ${rows}
@@ -803,9 +823,10 @@ Return only the finished spoken bulletin. Do not repeat any instruction or secti
   return { system, user };
 }
 
-function promptsForOutput(prompts, mode) {
+function promptsForOutput(prompts, mode, storyCount = 1) {
+  const exactCount = Math.max(1, Number(storyCount) || 1);
   if (mode === 'json') {
-    const contract = `OUTPUT CONTRACT: Return only valid JSON matching this shape: {"stories":["first finished spoken story","second finished spoken story"]}. Each array item must contain only words to be spoken on air. Do not include prompt text, instructions, labels, analysis, source lists, markdown, control markers, or extra keys.`;
+    const contract = `OUTPUT CONTRACT: Return only valid JSON shaped as {"stories":["finished spoken story", "..."]}. The stories array must contain exactly ${exactCount} ${exactCount === 1 ? 'item' : 'items'}. Each item must be one distinct, complete story containing only words to be spoken on air. Do not include prompt text, instructions, labels, analysis, source lists, markdown, control markers, or extra keys.`;
     return {
       system: `${prompts.system}
 
@@ -815,7 +836,7 @@ ${contract}`,
 ${contract}`,
     };
   }
-  const contract = 'OUTPUT CONTRACT: Return only the finished spoken bulletin. Put [[STORY_BREAK]] on its own line between stories. The marker is not spoken. Include no other labels or formatting.';
+  const contract = `OUTPUT CONTRACT: Return exactly ${exactCount} complete ${exactCount === 1 ? 'story' : 'stories'} as the finished spoken bulletin. Put [[STORY_BREAK]] on its own line between stories. The marker is not spoken. Include no other labels or formatting.`;
   return {
     system: `${prompts.system}
 
@@ -826,14 +847,15 @@ ${contract}`,
   };
 }
 
-function bulletinJsonSchema(maxStories) {
+function bulletinJsonSchema(storyCount) {
+  const exactCount = Math.max(1, Number(storyCount) || 1);
   return {
     type: 'object',
     properties: {
       stories: {
         type: 'array',
-        minItems: 1,
-        maxItems: Math.max(1, Number(maxStories) || 1),
+        minItems: exactCount,
+        maxItems: exactCount,
         items: {
           type: 'string',
           minLength: 1,
@@ -949,6 +971,7 @@ function unsafeOutputReason(stories, config, interestProfile = '') {
     /output contract/i,
     /return only (?:the )?finished spoken bulletin/i,
     /use no more than \d+ stories/i,
+    /select and write exactly \d+ distinct stor(?:y|ies)/i,
     /presenter (?:tagline|description)/i,
     /tone controls:/i,
     /the (?:user|system) prompt/i,
@@ -1027,7 +1050,7 @@ async function fetchJson(url, init, timeoutMs = 45000) {
   try { return JSON.parse(text); } catch { throw new Error(`Provider returned invalid JSON: ${text.slice(0, 200)}`); }
 }
 
-async function generateWithLeg(leg, rawLlm, prompts, config) {
+async function generateWithLeg(leg, rawLlm, prompts, config, targetStoryCount) {
   const provider = String(leg?.provider || '').trim();
   const model = String(leg?.model || '').trim();
   if (!provider || !model) throw new Error('SUB/WAVE has no LLM provider/model configured.');
@@ -1035,7 +1058,7 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
 
   if (provider === 'ollama') {
     const base = String(leg.ollamaUrl || rawLlm.ollamaUrl || 'http://host.docker.internal:11434').replace(/\/$/, '');
-    const outputPrompts = promptsForOutput(prompts, 'json');
+    const outputPrompts = promptsForOutput(prompts, 'json', targetStoryCount);
     const body = await fetchJson(`${base}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1047,7 +1070,7 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
         think: false,
         // Keep the shared station model warm across the next hourly bulletin.
         keep_alive: '75m',
-        format: bulletinJsonSchema(config.maxHeadlines),
+        format: bulletinJsonSchema(targetStoryCount),
         messages: [
           { role: 'system', content: outputPrompts.system },
           // `/no_think` is included as a second guard for community Qwen GGUF
@@ -1075,7 +1098,7 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
     return { text: trimOutput(raw), stories: null };
   }
 
-  const outputPrompts = promptsForOutput(prompts, 'markers');
+  const outputPrompts = promptsForOutput(prompts, 'markers', targetStoryCount);
 
   if (provider === 'anthropic') {
     const key = providerKey(provider, rawLlm);
@@ -1144,7 +1167,7 @@ async function generateWithLeg(leg, rawLlm, prompts, config) {
 }
 
 async function generateStoriesWithLeg(leg, rawLlm, prompts, config, candidates, interestProfile = '') {
-  const expectedMultiple = Math.min(config.maxHeadlines, candidates.length) > 1;
+  const targetStoryCount = Math.max(1, Math.min(Number(config.maxHeadlines) || 1, candidates.length));
   let lastReason = '';
 
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1152,14 +1175,14 @@ async function generateStoriesWithLeg(leg, rawLlm, prompts, config, candidates, 
       ...prompts,
       user: `${prompts.user}
 
-RETRY CORRECTION: The previous response was unsafe because it exposed instructions, planning, analysis, reasoning, used the wrong output format, or failed to separate the stories. Do not think aloud. Begin directly with the first finished on-air sentence and return only words the presenter should speak. Do not repeat any prompt text, section label, rule, source list, explanation, analysis, or thought process.${expectedMultiple ? ' Include at least two separate stories.' : ''}\n\n/no_think`,
+RETRY CORRECTION: The previous response was unsafe, used the wrong output format, or returned the wrong number of stories. Do not think aloud. Return exactly ${targetStoryCount} separately written ${targetStoryCount === 1 ? 'story' : 'stories'}, beginning directly with finished on-air copy. Do not repeat any prompt text, section label, rule, source list, explanation, analysis, or thought process.\n\n/no_think`,
     };
-    const generated = await generateWithLeg(leg, rawLlm, attemptPrompts, config);
-    const stories = storiesFromGeneration(generated, config.maxHeadlines);
+    const generated = await generateWithLeg(leg, rawLlm, attemptPrompts, config, targetStoryCount);
+    const stories = storiesFromGeneration(generated, targetStoryCount);
     if (!stories.length) {
       lastReason = 'returned no usable stories';
-    } else if (expectedMultiple && stories.length < 2) {
-      lastReason = 'did not separate multiple stories';
+    } else if (stories.length !== targetStoryCount) {
+      lastReason = `returned ${stories.length} stories instead of the required ${targetStoryCount}`;
     } else if (stories.some((story) => !/[.!?…][\s\"'”’)]*$/.test(story.trim()))) {
       lastReason = 'ended a story without completing its final sentence';
     } else {
@@ -2143,13 +2166,19 @@ async function runBulletin(reason = 'manual') {
   const config = await settings();
   try {
     await log(`Bulletin started (${reason}).`);
-    const { candidates, ledger, freshness } = await collectHeadlines(config);
+    const {
+      candidates, ledger, freshness, freshCount, availableCount, targetStoryCount,
+    } = await collectHeadlines(config);
+
+    if (targetStoryCount < Number(config.maxHeadlines)) {
+      await log(`Only ${targetStoryCount} of the requested ${config.maxHeadlines} stories can be produced because the current feeds supplied ${availableCount} usable candidate${availableCount === 1 ? '' : 's'}.`);
+    }
 
     const snapshot = await subwaveSnapshot();
     const audienceInterests = await interests();
     const presenter = resolvePresenter(snapshot, config);
     const activeLlm = snapshot.values?.llm || snapshot.raw?.llm || {};
-    await log(`Generating bulletin script with ${activeLlm.provider || 'unknown'}/${activeLlm.model || 'unknown'} (${freshness}; ${candidates.length} candidates).`);
+    await log(`Generating bulletin script with ${activeLlm.provider || 'unknown'}/${activeLlm.model || 'unknown'} (${freshness}; ${freshCount} fresh of ${availableCount} available; ${candidates.length} candidates; exactly ${targetStoryCount} ${targetStoryCount === 1 ? 'story' : 'stories'} requested).`);
     const generated = await generateBulletinText(snapshot, config, candidates, presenter, freshness, audienceInterests.profile);
     await log(`Bulletin script ready (${generated.stories.length} stories). Starting TTS.`);
     const speechPaths = [];
@@ -2202,6 +2231,9 @@ async function runBulletin(reason = 'manual') {
       spoken: generated.text,
       freshness,
       storyCount: generated.stories.length,
+      requestedStoryCount: Number(config.maxHeadlines),
+      availableCandidateCount: availableCount,
+      freshCandidateCount: freshCount,
       storyPauseSeconds: config.storyPauseSeconds,
       interruptedTrack: config.interruptCurrentTrack,
       packageDurationSeconds: packageInfo.duration,

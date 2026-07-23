@@ -1,5 +1,24 @@
 # SUB/WAVE Hourly News Bulletin
 
+## v0.5.17 exact story-count selection
+
+- Fixes **Stories per bulletin** behaving like a loose maximum. When enough
+  current feed items are available, the generated bulletin must now contain the
+  exact requested number of separately completed stories.
+- Fixes the main reason a six-story setting could produce only two stories. The
+  old candidate builder supplied only unseen headlines whenever even one fresh
+  item existed. It now places unseen items first, then fills the remaining
+  candidate pool with still-current previously seen feed items.
+- Makes the Ollama structured-output schema require the exact story count and
+  validates the same count for every other supported LLM provider. A response
+  with too few stories is retried once and is never silently accepted.
+- Ensures the candidate pool can never be configured below the requested story
+  count internally. When a feed truly contains fewer usable items than the
+  requested count, the log states the available and requested totals rather than
+  implying that the LLM arbitrarily shortened the report.
+- Renames the control to **Stories per bulletin** and clarifies its exact-count
+  behaviour in the manager UI.
+
 ## v0.5.16 full-package queue protection
 
 - Fixes the remaining mid-bulletin cutoff at the actual playout boundary. The
